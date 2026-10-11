@@ -16,14 +16,15 @@ use ratatui_image::{
     picker::Picker,
     thread::{ResizeRequest, ResizeResponse, ThreadProtocol},
 };
-use rspotify::model::RepeatState;
+use rspotify::model::{PlaylistId, RepeatState};
 use rspotify::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::task::AbortHandle;
 
 use crate::keymap::{Command, command_for, step_index};
 use crate::spotify::{
-    self, Action, ApiError, Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind,
-    SearchResults, TrackEntry,
+    self, Action, ApiError, Client, ContextEntry, ContextStart, DeviceEntry, Playback,
+    PlaylistEntry, SearchKind, SearchResults, TrackEntry,
 };
 use crate::terminal;
 
@@ -32,10 +33,18 @@ const SEEK_STEP_MS: u64 = 10_000;
 const VOLUME_STEP: i32 = 5;
 /// Sin red, el estado se vuelve a consultar cada 10 s en lugar de cada 3 s.
 const OFFLINE_RETRY: Duration = Duration::from_secs(10);
+/// Spotify tarda un poco en reflejar los cambios (estado, cola...).
+const SETTLE: Duration = Duration::from_millis(600);
+/// Tras fallar la descarga de una carátula, espera antes de reintentarla.
+const COVER_RETRY: Duration = Duration::from_secs(30);
 
 /// Mensajes que llegan al bucle principal desde las tareas en segundo plano.
 pub enum Msg {
-    Playback(Result<Option<Playback>>),
+    /// Estado de reproducción; `seq` es el número de la consulta que lo pidió.
+    Playback {
+        seq: u64,
+        result: Result<Option<Playback>>,
+    },
     Playlists(Result<Vec<PlaylistEntry>>),
     Tracks {
         request: u64,
@@ -66,8 +75,9 @@ pub enum Msg {
 }
 
 /// Lanza una tarea que siempre responde con un mensaje: si la tarea sufre un
-/// *panic*, se envía [`Msg::Crashed`] en lugar de perder la respuesta.
-pub fn spawn_guarded<Fut>(tx: UnboundedSender<Msg>, task: Fut)
+/// *panic*, se envía [`Msg::Crashed`] en lugar de perder la respuesta. Solo
+/// una tarea cancelada (con el `AbortHandle` devuelto) no responde.
+pub fn spawn_guarded<Fut>(tx: UnboundedSender<Msg>, task: Fut) -> AbortHandle
 where
     Fut: Future<Output = Msg> + Send + 'static,
 {
@@ -77,7 +87,30 @@ where
             Err(payload) => Msg::Crashed(terminal::panic_message(payload)),
         };
         let _ = tx.send(msg);
-    });
+    })
+    .abort_handle()
+}
+
+/// Renueva la sesión si hace falta, en su propia tarea: si se cancela la
+/// petición que la necesitaba (una lista que ya no interesa), la renovación
+/// termina igualmente. Cortarla a medias perdería la sesión, porque con PKCE
+/// cada refresh token solo sirve una vez.
+///
+/// Si no se pudo renovar, se avisa y la petición sigue (fallará con su propio
+/// mensaje, sin bloquear la interfaz). Devuelve [`Msg::Crashed`] si la
+/// renovación sufrió un *panic*.
+async fn renew_session(sp: Client, tx: &UnboundedSender<Msg>) -> Option<Msg> {
+    match tokio::spawn(async move { spotify::ensure_token(&sp).await }).await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            let _ = tx.send(Msg::SessionProblem(e.to_string()));
+            None
+        }
+        Err(e) => e
+            .try_into_panic()
+            .ok()
+            .map(|payload| Msg::Crashed(terminal::panic_message(payload))),
+    }
 }
 
 /// Igual que [`spawn_guarded`] pero para trabajo pesado de CPU (en otro hilo).
@@ -117,6 +150,13 @@ pub enum TrackSource {
 pub enum MainContent {
     Loading(String),
     Message(String),
+    /// No se pudieron cargar las canciones de una playlist o álbum (p. ej. una
+    /// playlist ajena, que Spotify no deja ver), pero Enter la reproduce entera.
+    Unlisted {
+        title: String,
+        message: String,
+        context: PlayContextId<'static>,
+    },
     Tracks {
         title: String,
         source: TrackSource,
@@ -127,6 +167,23 @@ pub enum MainContent {
         kind: SearchKind,
         items: Vec<ContextEntry>,
     },
+}
+
+/// Cómo se presenta la carga de una lista de canciones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadMode {
+    /// Lista nueva: «Cargando…» y selección en la primera fila.
+    Open,
+    /// Recarga en segundo plano de la lista visible: no la borra mientras
+    /// carga y conserva la fila seleccionada.
+    Reload,
+}
+
+/// Lista de canciones que se está cargando.
+struct PendingList {
+    title: String,
+    source: TrackSource,
+    mode: LoadMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,19 +222,32 @@ pub struct App {
 
     pub playback: Option<Playback>,
     playback_inflight: bool,
+    /// Número de la última consulta del estado de reproducción lanzada.
+    poll_seq: u64,
+    /// Las respuestas de consultas con un número menor están obsoletas: se
+    /// lanzaron antes de la última acción o ya se aplicó una más reciente.
+    fresh_poll: u64,
     /// Última consulta del estado de reproducción (`None` = nunca).
     last_poll: Option<Instant>,
     refresh_at: Option<Instant>,
 
     pub playlists: Vec<PlaylistEntry>,
+    /// Hay una carga de las playlists en curso.
+    playlists_inflight: bool,
     pub library_state: ListState,
     pub active_library: Option<LibraryItem>,
 
     pub main: MainContent,
     pub main_state: TableState,
     request_id: u64,
-    /// Título y origen de la lista que se está cargando.
-    pending_list: Option<(String, TrackSource)>,
+    /// Lista que se está cargando.
+    pending_list: Option<PendingList>,
+    /// Recarga programada de la lista visible (la cola tras saltar de
+    /// canción, por ejemplo).
+    list_reload_at: Option<Instant>,
+    /// Tarea de la lista (o búsqueda) que se está cargando, para cancelarla
+    /// si se pide otra antes de que termine.
+    list_task: Option<AbortHandle>,
     /// Tras un 429 de Spotify, no se consulta hasta este instante.
     backoff_until: Option<Instant>,
 
@@ -187,6 +257,12 @@ pub struct App {
     pub picker: Picker,
     pub cover: ThreadProtocol,
     cover_url: Option<String>,
+    /// Carátula descargada: permite volver a prepararla si falla su dibujo.
+    cover_image: Option<DynamicImage>,
+    /// Veces que se ha vuelto a preparar la carátula actual.
+    cover_rebuilds: u8,
+    /// Tras fallar la descarga de la carátula, cuándo se puede reintentar.
+    cover_retry_at: Option<Instant>,
 
     pub status: Option<Status>,
 
@@ -247,21 +323,29 @@ impl App {
             big_cover: false,
             playback: None,
             playback_inflight: false,
+            poll_seq: 0,
+            fresh_poll: 0,
             last_poll: None,
             refresh_at: None,
             playlists: Vec::new(),
+            playlists_inflight: false,
             library_state,
             active_library: None,
             main: MainContent::Message("Elige una lista en la biblioteca (Enter).".into()),
             main_state: TableState::default(),
             request_id: 0,
             pending_list: None,
+            list_reload_at: None,
+            list_task: None,
             backoff_until: None,
             search_input: String::new(),
             search_kind: SearchKind::Tracks,
             picker,
             cover: ThreadProtocol::new(resize_tx, None),
             cover_url: None,
+            cover_image: None,
+            cover_rebuilds: 0,
+            cover_retry_at: None,
             status: None,
             pending_seek: Debounced::default(),
             pending_volume: Debounced::default(),
@@ -285,7 +369,9 @@ impl App {
     // Tareas en segundo plano
     // -----------------------------------------------------------------------
 
-    fn spawn<F, Fut>(&self, f: F)
+    /// Lanza una petición a Spotify en segundo plano (renovando antes la
+    /// sesión si hace falta). Devuelve el `AbortHandle` para cancelarla.
+    fn spawn<F, Fut>(&self, f: F) -> AbortHandle
     where
         F: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Msg> + Send + 'static,
@@ -293,26 +379,39 @@ impl App {
         let sp = self.spotify.clone();
         let tx = self.tx.clone();
         spawn_guarded(self.tx.clone(), async move {
-            // Si la sesión no se pudo renovar, se avisa (la petición sigue y
-            // fallará con su propio mensaje, sin bloquear la interfaz).
-            if let Err(e) = spotify::ensure_token(&sp).await {
-                let _ = tx.send(Msg::SessionProblem(e.to_string()));
+            if let Some(crashed) = renew_session(sp.clone(), &tx).await {
+                return crashed;
             }
             f(sp).await
-        });
+        })
     }
 
     fn since_last_poll(&self) -> Duration {
         self.last_poll.map_or(Duration::MAX, |t| t.elapsed())
     }
 
-    fn poll_playback(&mut self) {
-        if self.playback_inflight || self.backoff_until.is_some_and(|t| Instant::now() < t) {
-            return;
+    /// Consulta el estado de reproducción, salvo que ya haya una consulta en
+    /// curso o haya que esperar (429 o sin red). Devuelve si se lanzó.
+    fn poll_playback(&mut self) -> bool {
+        if self.playback_inflight || self.backing_off() {
+            return false;
         }
         self.playback_inflight = true;
         self.last_poll = Some(Instant::now());
-        self.spawn(|sp| async move { Msg::Playback(spotify::playback(&sp).await) });
+        self.poll_seq += 1;
+        let seq = self.poll_seq;
+        self.spawn(move |sp| async move {
+            Msg::Playback {
+                seq,
+                result: spotify::playback(&sp).await,
+            }
+        });
+        true
+    }
+
+    /// Hay que esperar antes de consultar (429 de Spotify o sin red).
+    fn backing_off(&self) -> bool {
+        self.backoff_until.is_some_and(|t| Instant::now() < t)
     }
 
     fn schedule_refresh(&mut self, after: Duration) {
@@ -321,20 +420,77 @@ impl App {
     }
 
     fn load_playlists(&mut self) {
+        // Mantener pulsada R no lanza una carga por cada repetición de la tecla.
+        if self.playlists_inflight {
+            return;
+        }
+        self.playlists_inflight = true;
         self.spawn(|sp| async move { Msg::Playlists(spotify::playlists(&sp).await) });
     }
 
-    /// Prepara la vista principal para una nueva lista; las respuestas de
-    /// peticiones anteriores se descartan comparando el identificador.
-    fn next_request(&mut self, title: String, source: TrackSource) -> u64 {
+    /// Cancela la carga de lista en curso e invalida su identificador: si su
+    /// respuesta llega igualmente, se descarta.
+    fn abandon_request(&mut self) {
+        if let Some(task) = self.list_task.take() {
+            task.abort();
+        }
         self.request_id += 1;
-        self.main = MainContent::Loading(format!("Cargando «{title}»…"));
-        self.pending_list = Some((title, source));
+        self.pending_list = None;
+    }
+
+    /// Prepara la vista principal para una nueva petición mostrando `loading`.
+    /// La anterior deja de interesar: se cancela para no seguir pidiendo
+    /// páginas a Spotify, y su respuesta se descarta por el identificador.
+    /// También se olvida la recarga programada de la lista anterior.
+    fn begin_request(&mut self, loading: String) -> u64 {
+        self.abandon_request();
+        self.list_reload_at = None;
+        self.main = MainContent::Loading(loading);
         self.main_state = TableState::default();
         self.request_id
     }
 
+    /// Como [`Self::begin_request`], para una lista de canciones con su título
+    /// y su origen. Una recarga no borra lo que se ve, salvo que la lista aún
+    /// se estuviera cargando (entonces equivale a abrirla de nuevo).
+    fn next_request(&mut self, title: String, source: TrackSource, mode: LoadMode) -> u64 {
+        let mode = match self.main {
+            MainContent::Loading(_) => LoadMode::Open,
+            _ => mode,
+        };
+        match mode {
+            LoadMode::Open => {
+                self.begin_request(format!("Cargando «{title}»…"));
+            }
+            LoadMode::Reload => self.abandon_request(),
+        }
+        self.pending_list = Some(PendingList {
+            title,
+            source,
+            mode,
+        });
+        self.request_id
+    }
+
+    /// Hay una carga de lista (o búsqueda) en curso.
+    fn list_loading(&self) -> bool {
+        self.list_task.as_ref().is_some_and(|t| !t.is_finished())
+    }
+
+    /// Lanza la carga de la petición en curso y guarda su tarea para poder
+    /// cancelarla.
+    fn spawn_list<F, Fut>(&mut self, f: F)
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Msg> + Send + 'static,
+    {
+        self.list_task = Some(self.spawn(f));
+    }
+
     fn do_action(&mut self, action: Action) {
+        // Las consultas del estado ya lanzadas no reflejan esta acción: su
+        // respuesta desharía el cambio optimista (p. ej. la pausa recién pulsada).
+        self.fresh_poll = self.poll_seq + 1;
         let done = action.done_message();
         let refresh_queue = action.changes_queue();
         self.spawn(move |sp| async move {
@@ -395,47 +551,80 @@ impl App {
         }
     }
 
+    /// Muestra la vista principal con el foco: lo que se abra a continuación
+    /// tiene que verse (la carátula grande la taparía).
+    fn show_list(&mut self) {
+        self.focus = Focus::Main;
+        self.big_cover = false;
+    }
+
+    /// La lista principal tiene el foco pero la tapa la carátula grande.
+    fn list_hidden(&self) -> bool {
+        self.big_cover && self.focus == Focus::Main
+    }
+
     fn open_library(&mut self, item: LibraryItem) {
         self.active_library = Some(item);
-        self.focus = Focus::Main;
+        self.show_list();
+        self.load_library(item, LoadMode::Open);
+    }
+
+    /// Recarga en segundo plano la lista de la biblioteca que se está viendo,
+    /// sin mover el foco, la carátula ni la selección.
+    fn reload_active(&mut self) {
+        if let Some(item) = self.active_library {
+            self.load_library(item, LoadMode::Reload);
+        }
+    }
+
+    /// Pide en segundo plano las canciones de una entrada de la biblioteca.
+    fn load_library(&mut self, item: LibraryItem, mode: LoadMode) {
         let title = self.library_title(item);
+        let loose = TrackSource::Uris;
         match item {
-            LibraryItem::Liked => {
-                let req = self.next_request(title, TrackSource::Uris);
-                self.load_tracks(req, |sp| async move { spotify::saved_tracks(&sp).await });
-            }
-            LibraryItem::Recent => {
-                let req = self.next_request(title, TrackSource::Uris);
-                self.load_tracks(req, |sp| async move { spotify::recently_played(&sp).await });
-            }
+            LibraryItem::Liked => self.load_tracks(title, loose, mode, |sp| async move {
+                spotify::saved_tracks(&sp).await
+            }),
+            LibraryItem::Recent => self.load_tracks(title, loose, mode, |sp| async move {
+                spotify::recently_played(&sp).await
+            }),
             LibraryItem::Queue => {
-                let req = self.next_request(title, TrackSource::Uris);
-                self.load_tracks(req, |sp| async move { spotify::queue(&sp).await });
+                self.load_tracks(
+                    title,
+                    loose,
+                    mode,
+                    |sp| async move { spotify::queue(&sp).await },
+                )
             }
             LibraryItem::Playlist(i) => {
-                let Some(id) = self.playlists.get(i).map(|p| p.id.clone()) else {
-                    return;
-                };
-                let source = TrackSource::Context(PlayContextId::Playlist(id.clone()));
-                let req = self.next_request(title, source);
-                self.load_tracks(
-                    req,
-                    |sp| async move { spotify::playlist_tracks(&sp, id).await },
-                );
+                if let Some(id) = self.playlists.get(i).map(|p| p.id.clone()) {
+                    self.load_playlist(title, id, mode);
+                }
             }
         }
     }
 
-    fn load_tracks<F, Fut>(&self, request: u64, f: F)
+    /// Pide en segundo plano las canciones de la lista (con «Cargando…» si
+    /// es una lista nueva).
+    fn load_tracks<F, Fut>(&mut self, title: String, source: TrackSource, mode: LoadMode, fetch: F)
     where
         F: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Vec<TrackEntry>>> + Send + 'static,
     {
-        self.spawn(move |sp| async move {
+        let request = self.next_request(title, source, mode);
+        self.spawn_list(move |sp| async move {
             Msg::Tracks {
                 request,
-                result: f(sp).await,
+                result: fetch(sp).await,
             }
+        });
+    }
+
+    /// Carga una playlist: al reproducirla se usa su contexto.
+    fn load_playlist(&mut self, title: String, id: PlaylistId<'static>, mode: LoadMode) {
+        let source = TrackSource::Context(PlayContextId::Playlist(id.clone()));
+        self.load_tracks(title, source, mode, |sp| async move {
+            spotify::playlist_tracks(&sp, id).await
         });
     }
 
@@ -457,17 +646,14 @@ impl App {
         match entry.id {
             PlayContextId::Playlist(id) => {
                 self.active_library = None;
-                let req = self.next_request(entry.name, source);
-                self.load_tracks(
-                    req,
-                    |sp| async move { spotify::playlist_tracks(&sp, id).await },
-                );
+                self.show_list();
+                self.load_playlist(entry.name, id, LoadMode::Open);
             }
             PlayContextId::Album(id) => {
                 self.active_library = None;
+                self.show_list();
                 let name = entry.name.clone();
-                let req = self.next_request(entry.name, source);
-                self.load_tracks(req, |sp| async move {
+                self.load_tracks(entry.name, source, LoadMode::Open, move |sp| async move {
                     spotify::album_tracks(&sp, id, &name).await
                 });
             }
@@ -483,15 +669,15 @@ impl App {
         let kind = self.search_kind;
         let title = format!("Búsqueda: «{query}» · {}", kind.label());
         self.active_library = None;
-        self.focus = Focus::Main;
-        let req = self.next_request(title.clone(), TrackSource::Uris);
-        self.main = MainContent::Loading(format!(
+        self.show_list();
+        // El título viaja con la respuesta (`Msg::Search`), no en `pending_list`.
+        let request = self.begin_request(format!(
             "Buscando {} «{query}»…",
             kind.label().to_lowercase()
         ));
-        self.spawn(move |sp| async move {
+        self.spawn_list(move |sp| async move {
             Msg::Search {
-                request: req,
+                request,
                 title,
                 kind,
                 result: spotify::search(&sp, &query, kind).await,
@@ -508,6 +694,15 @@ impl App {
     }
 
     fn activate_main(&mut self) {
+        if let MainContent::Unlisted { title, context, .. } = &self.main {
+            let action = Action::PlayContext {
+                context: context.clone(),
+                start: None,
+            };
+            self.set_status(format!("Reproduciendo «{title}»"), false);
+            self.do_action(action);
+            return;
+        }
         let Some(i) = self.main_state.selected() else {
             return;
         };
@@ -515,10 +710,14 @@ impl App {
             MainContent::Tracks { source, tracks, .. } => {
                 let Some(track) = tracks.get(i) else { return };
                 let action = match source {
-                    TrackSource::Context(ctx) => Some(Action::PlayContext {
-                        context: ctx.clone(),
-                        start_uri: track.uri(),
-                    }),
+                    // Un archivo local (sin id) no se puede elegir: Spotify
+                    // empezaría la lista por el principio.
+                    TrackSource::Context(ctx) => {
+                        context_start(tracks, i).map(|start| Action::PlayContext {
+                            context: ctx.clone(),
+                            start: Some(start),
+                        })
+                    }
                     TrackSource::Uris => {
                         // Solo las entradas con ID son reproducibles (no archivos locales).
                         let start = tracks[..i].iter().filter(|t| t.id.is_some()).count();
@@ -535,7 +734,7 @@ impl App {
                 let Some(entry) = items.get(i) else { return };
                 let action = Action::PlayContext {
                     context: entry.id.clone(),
-                    start_uri: None,
+                    start: None,
                 };
                 (Some(action), entry.name.clone())
             }
@@ -680,10 +879,18 @@ impl App {
         self.flush_debounced();
         let now = Instant::now();
         if self.refresh_at.is_some_and(|at| now >= at) {
-            self.refresh_at = None;
-            self.poll_playback();
+            // Si hay una consulta en curso (o hay que esperar), el refresco no
+            // se pierde: se reintenta en el siguiente tick.
+            if self.poll_playback() {
+                self.refresh_at = None;
+            }
         } else if self.since_last_poll() >= self.poll_every {
             self.poll_playback();
+        }
+        // La recarga programada espera también si Spotify pidió calma.
+        if self.list_reload_at.is_some_and(|at| now >= at) && !self.backing_off() {
+            self.list_reload_at = None;
+            self.reload_active();
         }
         // Al terminar la canción, se consulta enseguida la siguiente.
         if let Some(pb) = &self.playback
@@ -698,47 +905,26 @@ impl App {
 
     pub fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Playback(result) => {
-                self.playback_inflight = false;
+            Msg::Playback { seq, result } => self.on_playback(seq, result),
+            Msg::Playlists(result) => {
+                self.playlists_inflight = false;
                 match result {
-                    Ok(pb) => {
-                        self.session_problem = None;
-                        self.set_playback(pb);
-                    }
+                    Ok(list) => self.replace_playlists(list),
                     Err(e) => {
-                        self.note_rate_limit(&e);
-                        self.set_status(format!("Error al consultar la reproducción: {e}"), true);
+                        self.set_status(format!("No se pudieron cargar las playlists: {e}"), true)
                     }
                 }
             }
-            Msg::Playlists(result) => match result {
-                Ok(list) => self.playlists = list,
-                Err(e) => {
-                    self.set_status(format!("No se pudieron cargar las playlists: {e}"), true)
-                }
-            },
             Msg::Tracks { request, result } => {
                 if request != self.request_id {
                     return;
                 }
-                let (title, source) = self
-                    .pending_list
-                    .take()
-                    .unwrap_or_else(|| ("Canciones".into(), TrackSource::Uris));
-                self.main = match result {
-                    Ok(tracks) if tracks.is_empty() => {
-                        MainContent::Message(format!("«{title}» está vacía."))
-                    }
-                    Ok(tracks) => {
-                        self.main_state.select(Some(0));
-                        MainContent::Tracks {
-                            title,
-                            source,
-                            tracks,
-                        }
-                    }
-                    Err(e) => MainContent::Message(format!("No se pudo cargar «{title}»: {e}")),
-                };
+                let pending = self.pending_list.take().unwrap_or(PendingList {
+                    title: "Canciones".into(),
+                    source: TrackSource::Uris,
+                    mode: LoadMode::Open,
+                });
+                self.show_tracks(pending, result);
             }
             Msg::Search {
                 request,
@@ -749,7 +935,6 @@ impl App {
                 if request != self.request_id {
                     return;
                 }
-                self.pending_list = None;
                 self.main = match result {
                     Ok(SearchResults::Tracks(tracks)) if !tracks.is_empty() => {
                         self.main_state.select(Some(0));
@@ -790,6 +975,7 @@ impl App {
                 refresh_queue,
                 result,
             } => {
+                let succeeded = result.is_ok();
                 match result {
                     Ok(()) => {
                         if let Some(text) = done {
@@ -801,10 +987,10 @@ impl App {
                         self.set_status(e.to_string(), true);
                     }
                 }
-                // Spotify tarda un poco en reflejar los cambios.
-                self.schedule_refresh(Duration::from_millis(600));
-                if refresh_queue && self.active_library == Some(LibraryItem::Queue) {
-                    self.open_library(LibraryItem::Queue);
+                self.schedule_refresh(SETTLE);
+                // La cola visible se recarga sin quitar el foco ni la selección.
+                if succeeded && refresh_queue && self.active_library == Some(LibraryItem::Queue) {
+                    self.schedule_list_reload();
                 }
             }
             Msg::Cover { url, result } => {
@@ -812,19 +998,27 @@ impl App {
                     return;
                 }
                 match result {
-                    Ok(img) => self
-                        .cover
-                        .replace_protocol(self.picker.new_resize_protocol(img)),
-                    Err(e) => self.set_status(format!("No se pudo cargar la carátula: {e}"), true),
+                    Ok(img) => self.set_cover_image(img),
+                    Err(e) => {
+                        // Mejor el logo que la carátula de la canción anterior;
+                        // la descarga se reintentará más tarde.
+                        self.clear_cover();
+                        self.cover_retry_at = Some(Instant::now() + COVER_RETRY);
+                        self.set_status(format!("No se pudo cargar la carátula: {e}"), true);
+                    }
                 }
             }
             Msg::Resized(result) => match result {
                 Ok(resp) => {
                     self.cover.update_resized_protocol(resp);
                 }
-                Err(e) => self.set_status(format!("Error al dibujar la carátula: {e}"), true),
+                Err(e) => {
+                    if !self.rebuild_cover() {
+                        self.set_status(format!("Error al dibujar la carátula: {e}"), true);
+                    }
+                }
             },
-            Msg::Crashed(reason) => self.recover_from_crash(&reason),
+            Msg::Crashed(reason) => self.report_crash(&reason),
             Msg::SessionProblem(reason) => {
                 self.session_problem = Some(reason.clone());
                 self.set_status(reason, true);
@@ -832,27 +1026,58 @@ impl App {
         }
     }
 
-    /// Deja el estado coherente tras un fallo inesperado en una tarea.
-    fn recover_from_crash(&mut self, reason: &str) {
+    /// Respuesta de la consulta número `seq` del estado de reproducción.
+    fn on_playback(&mut self, seq: u64, result: Result<Option<Playback>>) {
+        // Tras un fallo inesperado puede haber dos consultas en curso: la
+        // marca solo se quita con la respuesta de la última.
+        if seq == self.poll_seq {
+            self.playback_inflight = false;
+        }
+        match result {
+            Ok(pb) => {
+                self.session_problem = None;
+                // Una respuesta obsoleta desharía la última acción o pisaría
+                // una más reciente: se ignora.
+                if seq >= self.fresh_poll {
+                    self.fresh_poll = seq + 1;
+                    self.set_playback(pb);
+                }
+            }
+            Err(e) => {
+                self.note_rate_limit(&e);
+                self.set_status(format!("Error al consultar la reproducción: {e}"), true);
+            }
+        }
+    }
+
+    /// Registra un fallo inesperado (en una tarea, al dibujar o al procesar
+    /// un evento) y deja el estado coherente para seguir funcionando.
+    pub fn report_crash(&mut self, reason: &str) {
+        // El fallo pudo ser de la consulta del estado o de la carga de las
+        // playlists: se permite lanzar otra. Si la anterior sigue viva, su
+        // respuesta no pisa a una más reciente (ver `on_playback`).
         self.playback_inflight = false;
+        self.playlists_inflight = false;
         if matches!(self.main, MainContent::Loading(_)) {
-            self.pending_list = None;
+            // La carga se da por fallida de forma coherente: si su respuesta
+            // llega más tarde, se descarta en vez de mostrarse sin su título
+            // ni su origen (y reproducirse como una lista suelta).
+            self.abandon_request();
             self.main =
                 MainContent::Message(format!("No se pudo completar la operación: {reason}"));
         }
         if matches!(self.popup, Popup::Devices { devices: None, .. }) {
             self.popup = Popup::None;
         }
+        // Si falló el redimensionado de la carátula, la imagen se perdió con
+        // él: se vuelve a preparar a partir de la descargada.
+        if self.has_cover() && self.cover.protocol_type().is_none() {
+            self.rebuild_cover();
+        }
         self.set_status(
             format!("Error interno (la aplicación sigue funcionando): {reason}"),
             true,
         );
-    }
-
-    /// Registra un fallo capturado en el bucle principal (al dibujar o al
-    /// procesar un evento).
-    pub fn report_crash(&mut self, reason: &str) {
-        self.recover_from_crash(reason);
     }
 
     pub fn show_error(&mut self, text: String) {
@@ -871,10 +1096,23 @@ impl App {
                 new.volume = old.volume;
             }
         }
+        // Con otra canción cambian la cola y las recientes que se ven.
+        let old_uri = self.playback.as_ref().and_then(|p| p.item_uri.as_deref());
+        let new_uri = pb.as_ref().and_then(|p| p.item_uri.as_deref());
+        if old_uri != new_uri
+            && matches!(
+                self.active_library,
+                Some(LibraryItem::Queue | LibraryItem::Recent)
+            )
+        {
+            self.schedule_list_reload();
+        }
         let new_url = pb.as_ref().and_then(|p| p.cover_url.clone());
-        if new_url != self.cover_url {
+        if self.cover_needs_download(&new_url) {
             self.cover_url = new_url.clone();
+            self.cover_retry_at = None;
             match new_url {
+                // Mientras se descarga se sigue viendo la carátula anterior.
                 Some(url) => {
                     let http = self.http.clone();
                     spawn_guarded(self.tx.clone(), async move {
@@ -882,18 +1120,136 @@ impl App {
                         Msg::Cover { url, result }
                     });
                 }
-                None => self.cover.empty_protocol(),
+                None => self.clear_cover(),
             }
         }
         self.playback = pb;
+    }
+
+    /// Si hay que descargar la carátula `url`: es otra, o la anterior falló y
+    /// ya toca reintentarlo.
+    fn cover_needs_download(&self, url: &Option<String>) -> bool {
+        *url != self.cover_url || self.cover_retry_at.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Hay una carátula que mostrar (aunque ahora se esté redimensionando).
+    pub fn has_cover(&self) -> bool {
+        self.cover_image.is_some()
+    }
+
+    /// Muestra `img` como carátula.
+    pub fn set_cover_image(&mut self, img: DynamicImage) {
+        self.cover_rebuilds = 0;
+        let protocol = self.picker.new_resize_protocol(img.clone());
+        self.cover.replace_protocol(protocol);
+        self.cover_image = Some(img);
+    }
+
+    /// Quita la carátula: en su lugar se ve el logo.
+    fn clear_cover(&mut self) {
+        self.cover_image = None;
+        self.cover.empty_protocol();
+    }
+
+    /// Tras un fallo al redimensionar, la carátula se vuelve a preparar una
+    /// sola vez; si vuelve a fallar se quita (sale el logo). Devuelve si se
+    /// pudo volver a preparar.
+    fn rebuild_cover(&mut self) -> bool {
+        match &self.cover_image {
+            Some(img) if self.cover_rebuilds == 0 => {
+                self.cover_rebuilds += 1;
+                let protocol = self.picker.new_resize_protocol(img.clone());
+                self.cover.replace_protocol(protocol);
+                true
+            }
+            _ => {
+                self.clear_cover();
+                false
+            }
+        }
+    }
+
+    /// Programa la recarga de la lista visible cuando Spotify ya refleje el
+    /// cambio. Una petición posterior la vuelve a retrasar.
+    fn schedule_list_reload(&mut self) {
+        self.list_reload_at = Some(Instant::now() + SETTLE);
+    }
+
+    /// Sustituye las playlists conservando, por su id, la lista activa y la
+    /// que señala el cursor: el orden de Spotify cambia al crear o seguir una
+    /// playlist desde otro dispositivo.
+    fn replace_playlists(&mut self, list: Vec<PlaylistEntry>) {
+        let active_id = self.playlist_id(self.active_library);
+        let cursor = self.library_state.selected();
+        let cursor_id = self.playlist_id(cursor.and_then(|i| self.library_item(i)));
+        self.playlists = list;
+
+        if matches!(self.active_library, Some(LibraryItem::Playlist(_))) {
+            // Si ya no existe, la vista sigue mostrándola, pero sin marca.
+            self.active_library = self.playlist_index(active_id).map(LibraryItem::Playlist);
+        }
+        // Si la playlist del cursor ya no existe, se queda en la misma fila.
+        let old = cursor.unwrap_or(0);
+        let cursor = self
+            .playlist_index(cursor_id)
+            .map_or(old, |i| i + FIXED_LIBRARY.len());
+        let last = self.library_len().saturating_sub(1);
+        self.library_state.select(Some(cursor.min(last)));
+    }
+
+    /// Id de la playlist de `item`, si es una playlist.
+    fn playlist_id(&self, item: Option<LibraryItem>) -> Option<PlaylistId<'static>> {
+        match item {
+            Some(LibraryItem::Playlist(i)) => self.playlists.get(i).map(|p| p.id.clone()),
+            _ => None,
+        }
+    }
+
+    /// Posición actual de la playlist con ese id.
+    fn playlist_index(&self, id: Option<PlaylistId<'static>>) -> Option<usize> {
+        let id = id?;
+        self.playlists.iter().position(|p| p.id == id)
+    }
+
+    /// Muestra las canciones recibidas para la lista `pending`.
+    fn show_tracks(&mut self, pending: PendingList, result: Result<Vec<TrackEntry>>) {
+        let PendingList {
+            title,
+            source,
+            mode,
+        } = pending;
+        let reload = mode == LoadMode::Reload;
+        self.main = match result {
+            // Si falla una recarga, se sigue viendo la lista que había.
+            Err(e) if reload => {
+                self.set_status(format!("No se pudo actualizar «{title}»: {e}"), true);
+                return;
+            }
+            Err(e) => load_error(title, source, &e),
+            Ok(tracks) if tracks.is_empty() => {
+                MainContent::Message(format!("«{title}» está vacía."))
+            }
+            Ok(tracks) => {
+                let row = if reload {
+                    kept_row(self.main_state.selected(), tracks.len())
+                } else {
+                    0
+                };
+                self.main_state.select(Some(row));
+                MainContent::Tracks {
+                    title,
+                    source,
+                    tracks,
+                }
+            }
+        };
     }
 
     pub fn on_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
             Event::Paste(text) if matches!(self.popup, Popup::Search) => {
-                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
-                self.search_input.push_str(&clean);
+                self.search_input.push_str(&pasted_text(&text));
             }
             _ => {}
         }
@@ -925,6 +1281,9 @@ impl App {
     fn run(&mut self, command: Command) {
         use Command::*;
         match command {
+            // Con la carátula grande la lista no se ve: no se actúa a ciegas
+            // sobre ella (la carátula se cierra con 'c').
+            Activate | QueueSelected | OpenSelected | Move(_) | Jump(_) if self.list_hidden() => {}
             Quit => self.should_quit = true,
             Back => {}
             TogglePlay => self.toggle_play(),
@@ -943,6 +1302,10 @@ impl App {
             Refresh => {
                 self.load_playlists();
                 self.poll_playback();
+                // También la lista que se ve, salvo que ya se esté cargando.
+                if !self.list_loading() {
+                    self.reload_active();
+                }
                 self.set_status("Actualizando…", false);
             }
             SwitchFocus => {
@@ -979,15 +1342,27 @@ impl App {
             return;
         };
         match command {
-            Command::Back | Command::Quit | Command::OpenDevices => self.popup = Popup::None,
+            Command::Back | Command::Quit => self.popup = Popup::None,
+            // 'd' vuelve a buscar (como indica la ventana sin dispositivos),
+            // salvo que ya se esté buscando.
+            Command::OpenDevices => {
+                if devices.is_some() {
+                    self.open_devices();
+                }
+            }
             Command::Move(_) | Command::Jump(_) => {
                 let len = devices.as_ref().map_or(0, Vec::len);
                 state.select(step_index(state.selected(), len, command));
             }
             Command::Activate => {
+                // Mientras se busca, o sin dispositivos, la ventana sigue
+                // abierta con su explicación.
+                let Some(list) = devices.as_ref().filter(|l| !l.is_empty()) else {
+                    return;
+                };
                 let device = state
                     .selected()
-                    .and_then(|i| devices.as_ref().and_then(|d| d.get(i)))
+                    .and_then(|i| list.get(i))
                     .and_then(|d| d.id.clone());
                 self.popup = Popup::None;
                 match device {
@@ -1012,10 +1387,17 @@ impl App {
             KeyCode::Backspace => {
                 self.search_input.pop();
             }
+            // Algunas terminales envían Ctrl+H como retroceso.
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.search_input.pop();
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.search_input.clear();
             }
-            KeyCode::Char(c) => self.search_input.push(c),
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                delete_last_word(&mut self.search_input);
+            }
+            KeyCode::Char(c) if is_text_input(key.modifiers) => self.search_input.push(c),
             _ => {}
         }
     }
@@ -1034,6 +1416,69 @@ impl App {
             }
         }
     }
+}
+
+/// Lo que se muestra cuando no se pudo cargar una lista. Si era una playlist o
+/// un álbum, se conserva para poder reproducirlo entero con Enter.
+fn load_error(title: String, source: TrackSource, err: &anyhow::Error) -> MainContent {
+    let message = format!("No se pudo cargar «{title}»: {err}");
+    match source {
+        TrackSource::Context(context) => MainContent::Unlisted {
+            message: format!("{message}\n\nPulsa Enter para reproducir todas sus canciones."),
+            title,
+            context,
+        },
+        TrackSource::Uris => MainContent::Message(message),
+    }
+}
+
+/// Desde dónde reproducir la canción `index` de un contexto; `None` si no se
+/// puede (un archivo local, sin id). Spotify empieza por la primera aparición
+/// de la URI: si la canción se repite en la lista y se conoce su posición, se
+/// usa la posición.
+fn context_start(tracks: &[TrackEntry], index: usize) -> Option<ContextStart> {
+    let track = tracks.get(index)?;
+    let uri = track.uri()?;
+    let repeated = tracks.iter().filter(|t| t.id == track.id).nth(1).is_some();
+    match track.position {
+        Some(position) if repeated => Some(ContextStart::Position(position)),
+        _ => Some(ContextStart::Uri(uri)),
+    }
+}
+
+/// Fila que queda seleccionada al recargar una lista que ahora tiene `len`
+/// filas (`len` > 0): la misma de antes, o la última si ya no existe.
+fn kept_row(selected: Option<usize>, len: usize) -> usize {
+    selected.unwrap_or(0).min(len.saturating_sub(1))
+}
+
+/// Texto pegado en el buscador: los saltos de línea y tabuladores separan
+/// palabras (se cambian por un espacio) y el resto de caracteres de control
+/// se quitan.
+fn pasted_text(text: &str) -> String {
+    text.split(char::is_control)
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Si una tecla con estos modificadores escribe texto: sin Ctrl ni Alt, o
+/// con los dos a la vez (AltGr en Windows, para @, # o €).
+fn is_text_input(modifiers: KeyModifiers) -> bool {
+    let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    !modifiers.intersects(ctrl_alt) || modifiers.contains(ctrl_alt)
+}
+
+/// Borra la última palabra y los espacios que la siguen (Ctrl+W).
+fn delete_last_word(text: &mut String) {
+    let end = text.trim_end().len();
+    text.truncate(end);
+    let start = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    text.truncate(start);
 }
 
 pub fn repeat_label(state: RepeatState) -> &'static str {
@@ -1136,6 +1581,7 @@ pub mod tests {
                 album: "Thriller".into(),
                 duration_ms: 294_000,
                 id: None,
+                position: None,
             }]),
         });
         match &app.main {
@@ -1150,11 +1596,64 @@ pub mod tests {
         }
     }
 
+    /// Spotify no deja ver las canciones de una playlist ajena: se explica y
+    /// Enter la reproduce entera en lugar de no hacer nada.
+    #[tokio::test]
+    async fn unlisted_playlist_can_still_be_played() {
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![PlaylistEntry {
+            id: rspotify::model::PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string()).unwrap(),
+            name: "Today's Top Hits".into(),
+            owner: "Spotify".into(),
+            total: 50,
+        }];
+        app.library_state.select(Some(FIXED_LIBRARY.len()));
+        app.on_event(key(KeyCode::Enter));
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Err(anyhow::anyhow!(
+                "Spotify solo deja ver las canciones de tus playlists"
+            )),
+        });
+        match &app.main {
+            MainContent::Unlisted {
+                title,
+                message,
+                context,
+            } => {
+                assert_eq!(title, "Today's Top Hits");
+                assert!(message.contains("Enter"));
+                assert!(matches!(context, PlayContextId::Playlist(_)));
+            }
+            other => panic!("se esperaba poder reproducirla, no {other:?}"),
+        }
+        assert_eq!(app.focus, Focus::Main);
+        app.on_event(key(KeyCode::Enter));
+        let status = app.visible_status().map(|s| s.text.as_str());
+        assert_eq!(status, Some("Reproduciendo «Today's Top Hits»"));
+    }
+
+    /// Las listas sin contexto (me gusta, recientes...) no tienen nada que
+    /// reproducir si fallan: solo se muestra el error.
+    #[tokio::test]
+    async fn failed_loose_list_only_shows_the_error() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Enter));
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Err(anyhow::anyhow!("sin red")),
+        });
+        assert!(matches!(&app.main, MainContent::Message(m) if !m.contains("Enter")));
+    }
+
     #[tokio::test]
     async fn rate_limit_pauses_polling() {
         let (mut app, _rx) = test_app();
         let err = anyhow::Error::new(ApiError::rate_limited(Some(Duration::from_secs(30))));
-        app.on_msg(Msg::Playback(Err(err)));
+        app.on_msg(Msg::Playback {
+            seq: app.poll_seq,
+            result: Err(err),
+        });
         assert!(
             app.backoff_until
                 .is_some_and(|t| t > Instant::now() + Duration::from_secs(25))
@@ -1164,6 +1663,216 @@ pub mod tests {
             !app.playback_inflight,
             "no debe consultar durante la espera"
         );
+    }
+
+    fn playlist(name: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            id: PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string()).unwrap(),
+            name: name.into(),
+            owner: "o".into(),
+            total: 1,
+        }
+    }
+
+    fn song(name: &str) -> TrackEntry {
+        TrackEntry {
+            name: name.into(),
+            artists: "Artista".into(),
+            album: "Álbum".into(),
+            duration_ms: 200_000,
+            id: None,
+            position: None,
+        }
+    }
+
+    fn now_playing(title: &str, is_playing: bool) -> Playback {
+        Playback {
+            is_playing,
+            progress_ms: 1_000,
+            duration_ms: 200_000,
+            title: title.into(),
+            artists: "Artista".into(),
+            album: "Álbum".into(),
+            cover_url: None,
+            item_uri: None,
+            shuffle: false,
+            repeat: RepeatState::Off,
+            device_name: "Equipo".into(),
+            device_type: "Computer".into(),
+            volume: Some(50),
+            fetched_at: Instant::now(),
+        }
+    }
+
+    /// Deja terminar las tareas en segundo plano y recoge sus respuestas. Con
+    /// el cliente de prueba (sin sesión) fallan enseguida, sin usar la red.
+    async fn responses(app: &mut App) -> Vec<Msg> {
+        let mut msgs = Vec::new();
+        let wait = Duration::from_millis(300);
+        while let Ok(Some(msg)) = tokio::time::timeout(wait, app.rx.recv()).await {
+            msgs.push(msg);
+        }
+        msgs
+    }
+
+    /// Mantener pulsada R no apila cargas de playlists.
+    #[tokio::test]
+    async fn holding_refresh_loads_the_playlists_once() {
+        let (mut app, _rx) = test_app();
+        for _ in 0..5 {
+            app.on_event(key(KeyCode::Char('R')));
+        }
+        let msgs = responses(&mut app).await;
+        let loads = msgs
+            .iter()
+            .filter(|m| matches!(m, Msg::Playlists(_)))
+            .count();
+        assert_eq!(loads, 1);
+        for msg in msgs {
+            app.on_msg(msg);
+        }
+        assert!(!app.playlists_inflight, "la respuesta permite otra carga");
+        app.on_event(key(KeyCode::Char('R')));
+        assert!(app.playlists_inflight);
+    }
+
+    /// Al abrir otra lista (o buscar) la carga anterior se cancela: no sigue
+    /// pidiendo páginas a Spotify ni responde.
+    #[tokio::test]
+    async fn opening_another_list_cancels_the_previous_load() {
+        let (mut app, _rx) = test_app();
+        app.open_library(LibraryItem::Liked);
+        app.open_library(LibraryItem::Recent);
+        let lists = responses(&mut app).await;
+        let answered: Vec<u64> = lists
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Tracks { request, .. } => Some(*request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered, vec![app.request_id]);
+
+        app.open_library(LibraryItem::Queue);
+        app.search_input = "queen".into();
+        app.run_search();
+        let msgs = responses(&mut app).await;
+        assert!(!msgs.iter().any(|m| matches!(m, Msg::Tracks { .. })));
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::Search { request, .. } if *request == app.request_id))
+        );
+    }
+
+    /// Un fallo ajeno mientras carga una playlist la da por fallida: si su
+    /// respuesta llega luego, no aparece como una lista suelta «Canciones».
+    #[tokio::test]
+    async fn crash_while_loading_discards_the_late_list() {
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![playlist("Rock")];
+        app.open_library(LibraryItem::Playlist(0));
+        let request = app.request_id;
+        app.on_msg(Msg::Crashed("fallo al redimensionar la carátula".into()));
+        assert!(matches!(app.main, MainContent::Message(_)));
+        app.on_msg(Msg::Tracks {
+            request,
+            result: Ok(vec![song("Bohemian Rhapsody")]),
+        });
+        assert!(matches!(app.main, MainContent::Message(_)));
+        // Volver a abrirla funciona con normalidad.
+        app.open_library(LibraryItem::Playlist(0));
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Ok(vec![song("Bohemian Rhapsody")]),
+        });
+        assert!(matches!(
+            &app.main,
+            MainContent::Tracks { title, source: TrackSource::Context(_), .. } if title == "Rock"
+        ));
+    }
+
+    /// El refresco tras una acción no se pierde si coincide con una consulta
+    /// en curso: se hace en cuanto esta termina.
+    #[tokio::test]
+    async fn refresh_waits_for_the_poll_in_flight() {
+        let (mut app, _rx) = test_app();
+        assert!(app.poll_playback());
+        app.schedule_refresh(Duration::ZERO);
+        app.on_tick();
+        assert!(app.refresh_at.is_some(), "el refresco debe esperar");
+        app.on_msg(Msg::Playback {
+            seq: app.poll_seq,
+            result: Ok(None),
+        });
+        assert!(!app.playback_inflight);
+        app.on_tick();
+        assert!(app.playback_inflight, "se consulta en cuanto se puede");
+        assert!(app.refresh_at.is_none());
+    }
+
+    /// Una consulta enviada antes de pausar no vuelve a mostrar «reproduciendo».
+    #[tokio::test]
+    async fn poll_sent_before_a_pause_does_not_undo_it() {
+        let (mut app, _rx) = test_app();
+        app.playback = Some(now_playing("A", true));
+        assert!(app.poll_playback());
+        let before_pause = app.poll_seq;
+        app.on_event(key(KeyCode::Char(' ')));
+        app.on_msg(Msg::Playback {
+            seq: before_pause,
+            result: Ok(Some(now_playing("A", true))),
+        });
+        assert!(app.playback.as_ref().is_some_and(|pb| !pb.is_playing));
+        assert!(!app.playback_inflight, "se puede volver a consultar");
+        // Las consultas posteriores a la acción sí se aplican.
+        assert!(app.poll_playback());
+        app.on_msg(Msg::Playback {
+            seq: app.poll_seq,
+            result: Ok(Some(now_playing("B", true))),
+        });
+        assert_eq!(app.playback.as_ref().map(|pb| pb.title.as_str()), Some("B"));
+    }
+
+    /// Si tras un fallo inesperado hay dos consultas en vuelo, la respuesta
+    /// vieja nunca pisa a la nueva, llegue en el orden que llegue.
+    #[tokio::test]
+    async fn older_poll_never_overwrites_a_newer_one() {
+        let (mut app, _rx) = test_app();
+        let title = |app: &App| app.playback.as_ref().map(|pb| pb.title.clone());
+
+        // La vieja llega primero: se aplica, pero sigue esperando a la nueva.
+        assert!(app.poll_playback());
+        let old = app.poll_seq;
+        app.on_msg(Msg::Crashed("boom".into()));
+        assert!(app.poll_playback());
+        let new = app.poll_seq;
+        app.on_msg(Msg::Playback {
+            seq: old,
+            result: Ok(Some(now_playing("Vieja", true))),
+        });
+        assert!(app.playback_inflight);
+        app.on_msg(Msg::Playback {
+            seq: new,
+            result: Ok(Some(now_playing("Nueva", true))),
+        });
+        assert_eq!(title(&app).as_deref(), Some("Nueva"));
+        assert!(!app.playback_inflight);
+
+        // La nueva llega primero: la vieja se ignora.
+        assert!(app.poll_playback());
+        let old = app.poll_seq;
+        app.on_msg(Msg::Crashed("boom".into()));
+        assert!(app.poll_playback());
+        app.on_msg(Msg::Playback {
+            seq: app.poll_seq,
+            result: Ok(Some(now_playing("Nueva 2", true))),
+        });
+        app.on_msg(Msg::Playback {
+            seq: old,
+            result: Ok(Some(now_playing("Vieja 2", true))),
+        });
+        assert_eq!(title(&app).as_deref(), Some("Nueva 2"));
+        assert!(!app.playback_inflight);
     }
 
     #[test]
@@ -1181,6 +1890,433 @@ pub mod tests {
         assert_eq!(app.library_item(3), Some(LibraryItem::Playlist(0)));
         assert_eq!(app.library_item(4), None);
         assert_eq!(app.library_len(), 4);
+    }
+
+    const ID_A: &str = "4u7EnebtmKWzUH433cf5Qv";
+    const ID_B: &str = "5ChkMS8OtdzJeqyybCc9R5";
+
+    fn key_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    /// Canción reproducible con su posición en la lista.
+    fn track(name: &str, id: &str, position: Option<u32>) -> TrackEntry {
+        TrackEntry {
+            id: rspotify::model::TrackId::from_id(id.to_string())
+                .ok()
+                .map(rspotify::model::PlayableId::Track),
+            position,
+            ..song(name)
+        }
+    }
+
+    fn playlist_with_id(name: &str, id: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            id: PlaylistId::from_id(id.to_string()).unwrap(),
+            ..playlist(name)
+        }
+    }
+
+    fn tiny_image() -> DynamicImage {
+        DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
+    }
+
+    /// Muestra `tracks` como la lista cargada de la petición en curso.
+    fn deliver(app: &mut App, tracks: Vec<TrackEntry>) {
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Ok(tracks),
+        });
+    }
+
+    fn status(app: &App) -> Option<&str> {
+        app.visible_status().map(|s| s.text.as_str())
+    }
+
+    /// Con la carátula grande, buscar o abrir una lista la cierra: lo que se
+    /// carga tiene que verse.
+    #[tokio::test]
+    async fn opening_a_list_closes_the_big_cover() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('c')));
+        assert!(app.big_cover);
+        app.on_event(key(KeyCode::Char('/')));
+        for c in "queen".chars() {
+            app.on_event(key(KeyCode::Char(c)));
+        }
+        app.on_event(key(KeyCode::Enter));
+        assert!(!app.big_cover);
+        assert_eq!(app.focus, Focus::Main);
+
+        app.big_cover = true;
+        app.focus = Focus::Library;
+        app.on_event(key(KeyCode::Enter));
+        assert!(!app.big_cover, "abrir «Tus me gusta» también la cierra");
+
+        app.big_cover = true;
+        app.open_context(album("Bad"));
+        assert!(!app.big_cover, "abrir un álbum también la cierra");
+    }
+
+    /// La lista que tapa la carátula grande no se reproduce ni se mueve a
+    /// ciegas; al cerrar la carátula vuelve a responder.
+    #[tokio::test]
+    async fn hidden_list_ignores_play_queue_and_moves() {
+        let (mut app, _rx) = test_app();
+        app.main = MainContent::Tracks {
+            title: "Lista".into(),
+            source: TrackSource::Uris,
+            tracks: vec![track("A", ID_A, None), track("B", ID_B, None)],
+        };
+        app.main_state.select(Some(0));
+        app.focus = Focus::Main;
+        app.big_cover = true;
+        for code in [KeyCode::Char('j'), KeyCode::Enter, KeyCode::Char('a')] {
+            app.on_event(key(code));
+        }
+        assert_eq!(app.main_state.selected(), Some(0));
+        assert_eq!(status(&app), None);
+        assert_eq!(app.fresh_poll, 0, "no se envió ninguna acción");
+        app.on_event(key(KeyCode::Char('c')));
+        app.on_event(key(KeyCode::Char('j')));
+        assert_eq!(app.main_state.selected(), Some(1));
+    }
+
+    /// Tras saltar de canción con la cola abierta, la cola se recarga en
+    /// segundo plano: sin quitar el foco a la biblioteca ni mover la
+    /// selección, y solo si la acción fue bien.
+    #[tokio::test]
+    async fn queue_reload_keeps_focus_and_selection() {
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![playlist("Rock")];
+        app.open_library(LibraryItem::Queue);
+        deliver(&mut app, vec![song("A"), song("B"), song("C")]);
+        app.main_state.select(Some(2));
+        app.on_event(key(KeyCode::Tab));
+        app.library_state.select(Some(FIXED_LIBRARY.len()));
+
+        app.on_msg(Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            result: Err(anyhow::anyhow!("sin dispositivo")),
+        });
+        assert!(
+            app.list_reload_at.is_none(),
+            "una acción fallida no recarga"
+        );
+        app.on_msg(Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            result: Ok(()),
+        });
+        app.on_tick();
+        assert!(
+            app.pending_list.is_none(),
+            "espera a que Spotify lo refleje"
+        );
+        app.list_reload_at = Some(Instant::now());
+        app.on_tick();
+        assert!(
+            app.pending_list
+                .as_ref()
+                .is_some_and(|p| p.mode == LoadMode::Reload)
+        );
+        assert_eq!(app.focus, Focus::Library);
+        assert!(
+            matches!(app.main, MainContent::Tracks { .. }),
+            "sigue a la vista"
+        );
+
+        deliver(&mut app, vec![song("B"), song("C")]);
+        assert_eq!(
+            app.main_state.selected(),
+            Some(1),
+            "acotada al nuevo tamaño"
+        );
+        assert_eq!(app.focus, Focus::Library);
+        assert_eq!(app.library_state.selected(), Some(FIXED_LIBRARY.len()));
+
+        // Si la recarga falla, se sigue viendo la cola que había.
+        app.reload_active();
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Err(anyhow::anyhow!("sin red")),
+        });
+        assert!(matches!(&app.main, MainContent::Tracks { tracks, .. } if tracks.len() == 2));
+        assert!(status(&app).is_some_and(|s| s.contains("sin red")));
+
+        // Enter en la biblioteca abre la playlist señalada.
+        app.on_event(key(KeyCode::Enter));
+        assert_eq!(app.active_library, Some(LibraryItem::Playlist(0)));
+    }
+
+    /// R/F5 también recarga la lista que se ve, y con la cola (o las
+    /// recientes) abierta un cambio de canción programa su recarga.
+    #[tokio::test]
+    async fn refresh_and_song_changes_reload_the_visible_list() {
+        let (mut app, _rx) = test_app();
+        app.open_library(LibraryItem::Queue);
+        // Deja terminar la carga real (falla sin sesión) y muestra una lista.
+        responses(&mut app).await;
+        deliver(&mut app, vec![song("A"), song("B")]);
+        app.main_state.select(Some(1));
+        app.on_event(key(KeyCode::Char('R')));
+        assert!(
+            app.pending_list
+                .as_ref()
+                .is_some_and(|p| p.mode == LoadMode::Reload)
+        );
+        assert_eq!(app.main_state.selected(), Some(1));
+
+        let playing = |uri: &str| Playback {
+            item_uri: Some(uri.into()),
+            ..now_playing("A", true)
+        };
+        app.set_playback(Some(playing("spotify:track:a")));
+        app.list_reload_at = None;
+        app.set_playback(Some(playing("spotify:track:a")));
+        assert!(app.list_reload_at.is_none(), "la misma canción no recarga");
+        app.set_playback(Some(playing("spotify:track:b")));
+        assert!(app.list_reload_at.is_some());
+
+        // Abrir otra lista olvida la recarga programada, y en «Tus me gusta»
+        // un cambio de canción no recarga nada.
+        app.open_library(LibraryItem::Liked);
+        assert!(app.list_reload_at.is_none());
+        app.set_playback(Some(playing("spotify:track:c")));
+        assert!(app.list_reload_at.is_none());
+    }
+
+    /// Al recargar las playlists cambia su orden: la marca de activa y el
+    /// cursor siguen a la misma playlist, por su id.
+    #[tokio::test]
+    async fn reloaded_playlists_keep_the_active_one_and_the_cursor() {
+        let (mut app, _rx) = test_app();
+        let a = playlist_with_id("A", "37i9dQZF1DXcBWIGoYBM5A");
+        let b = playlist_with_id("B", "37i9dQZF1DXcBWIGoYBM5B");
+        let c = playlist_with_id("C", "37i9dQZF1DXcBWIGoYBM5C");
+        let new = playlist_with_id("Nueva", "37i9dQZF1DXcBWIGoYBM5N");
+        let fixed = FIXED_LIBRARY.len();
+        app.playlists = vec![a.clone(), b.clone(), c.clone()];
+        app.active_library = Some(LibraryItem::Playlist(1));
+        app.library_state.select(Some(fixed + 2));
+
+        app.on_msg(Msg::Playlists(Ok(vec![
+            new.clone(),
+            a.clone(),
+            b.clone(),
+            c.clone(),
+        ])));
+        assert_eq!(app.active_library, Some(LibraryItem::Playlist(2)));
+        assert_eq!(app.library_state.selected(), Some(fixed + 3));
+
+        // B y C desaparecen: B deja de estar marcada y el cursor no se sale.
+        app.on_msg(Msg::Playlists(Ok(vec![a.clone()])));
+        assert_eq!(app.active_library, None);
+        assert_eq!(app.library_state.selected(), Some(fixed));
+
+        // Las entradas fijas no se mueven.
+        app.active_library = Some(LibraryItem::Queue);
+        app.library_state.select(Some(1));
+        app.on_msg(Msg::Playlists(Ok(vec![new, a])));
+        assert_eq!(app.active_library, Some(LibraryItem::Queue));
+        assert_eq!(app.library_state.selected(), Some(1));
+    }
+
+    /// Enter mientras se buscan dispositivos (o sin ninguno) no cierra la
+    /// ventana con un aviso engañoso, y 'd' vuelve a buscar.
+    #[tokio::test]
+    async fn devices_popup_waits_for_a_device_and_d_searches_again() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('d')));
+        app.on_event(key(KeyCode::Enter));
+        assert!(matches!(app.popup, Popup::Devices { devices: None, .. }));
+        assert_eq!(status(&app), None);
+
+        app.on_msg(Msg::Devices(Ok(Vec::new())));
+        app.on_event(key(KeyCode::Enter));
+        assert!(matches!(
+            app.popup,
+            Popup::Devices {
+                devices: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(status(&app), None);
+
+        app.on_event(key(KeyCode::Char('d')));
+        assert!(matches!(app.popup, Popup::Devices { devices: None, .. }));
+        app.on_event(key(KeyCode::Esc));
+        assert!(matches!(app.popup, Popup::None));
+    }
+
+    /// Si falla la descarga de la carátula nueva no se queda la anterior: se
+    /// ve el logo y se reintenta pasado un tiempo, no en cada sondeo.
+    #[tokio::test]
+    async fn failed_cover_download_shows_the_logo_and_retries_later() {
+        let (mut app, _rx) = test_app();
+        // Puerto local cerrado: si la descarga llegara a lanzarse, falla ya.
+        let url = "http://127.0.0.1:9/carátula.jpg".to_string();
+        let with_cover = Playback {
+            cover_url: Some(url.clone()),
+            ..now_playing("B", true)
+        };
+        app.set_cover_image(tiny_image());
+        app.set_playback(Some(with_cover.clone()));
+        assert!(app.has_cover(), "mientras descarga se ve la anterior");
+
+        app.on_msg(Msg::Cover {
+            url: url.clone(),
+            result: Err(anyhow::anyhow!("tiempo agotado")),
+        });
+        assert!(!app.has_cover());
+        assert!(app.cover.protocol_type().is_none());
+
+        app.set_playback(Some(with_cover.clone()));
+        assert!(app.cover_retry_at.is_some(), "aún no toca reintentar");
+        app.cover_retry_at = Some(Instant::now());
+        app.set_playback(Some(with_cover));
+        assert!(app.cover_retry_at.is_none(), "se vuelve a descargar");
+        assert_eq!(app.cover_url.as_deref(), Some(url.as_str()));
+    }
+
+    /// Si falla el redimensionado de la carátula (o sufre un panic), se
+    /// vuelve a preparar una vez; si falla otra vez, se muestra el logo.
+    #[tokio::test]
+    async fn failed_cover_resize_is_rebuilt_once() {
+        use ratatui::layout::Size;
+        use ratatui_image::{Resize, ResizeEncodeRender};
+
+        let (mut app, mut resize_rx) = test_app();
+        // Como al dibujar: la imagen sale del protocolo para redimensionarse.
+        let start_resize = |app: &mut App| {
+            app.cover.resize_encode(&Resize::Fit(None), Size::new(8, 4));
+            assert!(app.cover.protocol_type().is_none());
+        };
+        let encode_error = || Msg::Resized(Err(Errors::Sixel("fallo simulado".into())));
+
+        app.set_cover_image(tiny_image());
+        start_resize(&mut app);
+        assert!(resize_rx.try_recv().is_ok());
+        assert!(app.has_cover(), "redimensionando no es «sin carátula»");
+        app.on_msg(encode_error());
+        assert!(app.cover.protocol_type().is_some(), "se vuelve a preparar");
+        assert_eq!(status(&app), None);
+
+        start_resize(&mut app);
+        app.on_msg(encode_error());
+        assert!(!app.has_cover(), "al segundo fallo, el logo");
+        assert!(status(&app).is_some_and(|s| s.contains("carátula")));
+
+        app.set_cover_image(tiny_image());
+        start_resize(&mut app);
+        app.on_msg(Msg::Crashed("panic al codificar".into()));
+        assert!(app.cover.protocol_type().is_some());
+    }
+
+    /// Enter sobre un archivo local de una playlist no la reproduce desde el
+    /// principio diciendo que suena el archivo.
+    #[tokio::test]
+    async fn local_file_in_a_playlist_is_not_played() {
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![playlist("Rock")];
+        app.open_library(LibraryItem::Playlist(0));
+        deliver(
+            &mut app,
+            vec![track("A", ID_A, Some(0)), song("archivo local.mp3")],
+        );
+        app.main_state.select(Some(1));
+        app.on_event(key(KeyCode::Enter));
+        assert_eq!(status(&app), Some("Esta canción no se puede reproducir"));
+        assert_eq!(app.fresh_poll, 0, "no se envió ninguna acción");
+    }
+
+    /// Una canción repetida en el contexto empieza en la fila elegida (por
+    /// posición); el resto, por su URI.
+    #[test]
+    fn repeated_song_starts_at_its_own_position() {
+        let uri = |id: &str| format!("spotify:track:{id}");
+        let tracks = vec![
+            track("A", ID_A, Some(0)),
+            track("B", ID_B, Some(1)),
+            track("A", ID_A, Some(5)),
+        ];
+        assert_eq!(context_start(&tracks, 2), Some(ContextStart::Position(5)));
+        assert_eq!(context_start(&tracks, 0), Some(ContextStart::Position(0)));
+        assert_eq!(
+            context_start(&tracks, 1),
+            Some(ContextStart::Uri(uri(ID_B)))
+        );
+        // Repetida, pero sin posición fiable: por URI.
+        let unknown = vec![track("A", ID_A, None), track("A", ID_A, None)];
+        assert_eq!(
+            context_start(&unknown, 1),
+            Some(ContextStart::Uri(uri(ID_A)))
+        );
+        assert_eq!(context_start(&[song("local")], 0), None);
+        assert_eq!(context_start(&tracks, 99), None);
+    }
+
+    #[test]
+    fn reload_keeps_the_row_within_the_new_list() {
+        assert_eq!(kept_row(Some(2), 3), 2);
+        assert_eq!(kept_row(Some(7), 3), 2);
+        assert_eq!(kept_row(None, 3), 0);
+        assert_eq!(kept_row(Some(4), 0), 0);
+    }
+
+    /// En el buscador, los atajos con Ctrl o Alt no escriben su letra; AltGr
+    /// (Ctrl+Alt) y Mayúsculas sí escriben, y Ctrl+W borra una palabra.
+    #[tokio::test]
+    async fn search_ignores_shortcuts_but_accepts_altgr() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('/')));
+        for c in "queen live".chars() {
+            app.on_event(key(KeyCode::Char(c)));
+        }
+        app.on_event(key_with(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.on_event(key_with(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.on_event(key_with(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(app.search_input, "queen live");
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        app.on_event(key_with(KeyCode::Char('@'), altgr));
+        app.on_event(key_with(KeyCode::Char('Q'), KeyModifiers::SHIFT));
+        assert_eq!(app.search_input, "queen live@Q");
+        app.on_event(key_with(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(app.search_input, "queen ");
+        app.on_event(key_with(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(app.search_input, "queen");
+        assert!(matches!(app.popup, Popup::Search));
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_last_word() {
+        for (before, after) in [
+            ("queen live", "queen "),
+            ("queen live   ", "queen "),
+            ("queen", ""),
+            ("", ""),
+            ("   ", ""),
+            ("東京 事変", "東京 "),
+            ("a\u{3000}b", "a\u{3000}"),
+        ] {
+            let mut text = before.to_string();
+            delete_last_word(&mut text);
+            assert_eq!(text, after, "desde «{before}»");
+        }
+    }
+
+    /// Al pegar varias líneas o una fila con tabuladores, las palabras no se
+    /// juntan.
+    #[test]
+    fn pasted_lines_and_tabs_become_spaces() {
+        assert_eq!(
+            pasted_text("Bohemian Rhapsody\nQueen"),
+            "Bohemian Rhapsody Queen"
+        );
+        assert_eq!(pasted_text("a\tb\r\nc\n"), "a b c");
+        assert_eq!(pasted_text("en\n"), "en");
+        assert_eq!(pasted_text("\n\t\u{0}"), "");
     }
 }
 
@@ -1240,9 +2376,13 @@ mod robustness {
 
     fn random_msg(rng: &mut Lcg, app: &App) -> Msg {
         let request = app.request_id.wrapping_sub((rng.next() % 2) as u64);
+        let seq = app.poll_seq.wrapping_sub((rng.next() % 2) as u64);
         match rng.next() % 8 {
-            0 => Msg::Playback(Ok(None)),
-            1 => Msg::Playback(err()),
+            0 => Msg::Playback {
+                seq,
+                result: Ok(None),
+            },
+            1 => Msg::Playback { seq, result: err() },
             2 => Msg::Tracks {
                 request,
                 result: Ok(Vec::new()),

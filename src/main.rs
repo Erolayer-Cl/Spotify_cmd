@@ -155,6 +155,15 @@ fn close_terminal(mut tui: DefaultTerminal) {
     }
 }
 
+/// Ejecuta `f` sobre la app; un panic se muestra en pantalla en vez de
+/// cerrarla. Todo brazo nuevo del bucle principal que procese algo con la app
+/// debe pasar por aquí (el dibujado tiene su propia protección).
+fn protected(app: &mut App, f: impl FnOnce(&mut App)) {
+    if let Err(reason) = terminal::guard(|| f(app)) {
+        app.report_crash(&reason);
+    }
+}
+
 /// Tras este número de errores seguidos leyendo el teclado, se sale.
 const MAX_INPUT_ERRORS: u32 = 20;
 /// Tras este número de fallos seguidos al dibujar, se muestra una pantalla mínima.
@@ -172,9 +181,7 @@ async fn run(
     let (resize_tx, mut resize_rx) = unbounded_channel();
     let mut app = App::new(spotify, picker, resize_tx, poll_secs);
     let msg_tx = app.sender();
-    if let Err(reason) = terminal::guard(|| app.start()) {
-        app.report_crash(&reason);
-    }
+    protected(&mut app, App::start);
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -210,9 +217,7 @@ async fn run(
             event = events.next() => match event {
                 Some(Ok(event)) => {
                     input_errors = 0;
-                    if let Err(reason) = terminal::guard(|| app.on_event(event)) {
-                        app.report_crash(&reason);
-                    }
+                    protected(&mut app, |a| a.on_event(event));
                 }
                 Some(Err(e)) => {
                     input_errors += 1;
@@ -225,9 +230,7 @@ async fn run(
                 None => break,
             },
             Some(msg) = app.rx.recv() => {
-                if let Err(reason) = terminal::guard(|| app.on_msg(msg)) {
-                    app.report_crash(&reason);
-                }
+                protected(&mut app, |a| a.on_msg(msg));
             }
             Some(request) = resize_rx.recv() => {
                 // Redimensionar y codificar la imagen es costoso: se hace fuera
@@ -237,9 +240,7 @@ async fn run(
                 });
             }
             _ = tick.tick() => {
-                if let Err(reason) = terminal::guard(|| app.on_tick()) {
-                    app.report_crash(&reason);
-                }
+                protected(&mut app, App::on_tick);
             }
             () = &mut shutdown => break,
         }
@@ -271,5 +272,25 @@ async fn shutdown_signal() {
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_shows_panics_instead_of_closing() {
+        let (mut app, _rx) = app::tests::test_app();
+        protected(&mut app, |_| panic!("fallo simulado"));
+        let status = app.status.as_ref().map(|s| (s.text.as_str(), s.error));
+        assert!(matches!(status, Some((text, true)) if text.contains("fallo simulado")));
+        assert!(!app.should_quit);
+
+        // Sin panic, la acción se aplica y no se informa de ningún error.
+        app.status = None;
+        protected(&mut app, |a| a.should_quit = true);
+        assert!(app.should_quit);
+        assert!(app.status.is_none());
     }
 }

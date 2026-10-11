@@ -198,15 +198,18 @@ fn library_line(
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = has_focus(app, Focus::Main);
-    // Id (sin "spotify:track:") de lo que suena, para marcarlo en la lista.
-    let playing_id = app
+    // Id (sin "spotify:track:") de la canción actual (suene o esté en pausa),
+    // para marcarla en la lista.
+    let current_id = app
         .playback
         .as_ref()
         .and_then(|p| p.item_uri.as_deref())
         .and_then(|uri| uri.rsplit(':').next());
 
     match &app.main {
-        MainContent::Loading(text) | MainContent::Message(text) => {
+        MainContent::Loading(text)
+        | MainContent::Message(text)
+        | MainContent::Unlisted { message: text, .. } => {
             let block = theme::panel(" Lista ", focused);
             let inner = block.inner(area);
             f.render_widget(block, area);
@@ -216,7 +219,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             let rows = tracks
                 .iter()
                 .enumerate()
-                .map(|(i, t)| track_row(i, t, is_playing(t, playing_id)))
+                .map(|(i, t)| track_row(i, t, is_current_track(t, current_id)))
                 .collect();
             let widths = [
                 Constraint::Length(4),
@@ -259,46 +262,37 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Compara ids sin reservar memoria: se llama para cada fila en cada frame.
-fn is_playing(track: &TrackEntry, playing_id: Option<&str>) -> bool {
-    match (&track.id, playing_id) {
-        (Some(id), Some(playing)) => id.id() == playing,
+/// `true` si `track` es la canción actual (suene o esté en pausa). Compara
+/// ids sin reservar memoria: se llama para cada fila en cada frame.
+fn is_current_track(track: &TrackEntry, current_id: Option<&str>) -> bool {
+    match (&track.id, current_id) {
+        (Some(id), Some(current)) => id.id() == current,
         _ => false,
     }
 }
 
-/// Fila de una canción; la que está sonando se marca con ♪ y en negrita.
+/// Fila de una canción; la canción actual se marca con ♪ y en negrita.
 /// Toma el texto prestado de `track`, sin copiarlo.
-fn track_row(index: usize, track: &TrackEntry, is_playing: bool) -> Row<'_> {
-    let number = if is_playing {
-        "♪".to_string()
+fn track_row(index: usize, track: &TrackEntry, current: bool) -> Row<'_> {
+    let (number, number_style, artist_style, row_style) = if current {
+        let strong = theme::strong();
+        ("♪".to_string(), strong, strong, strong)
     } else {
-        (index + 1).to_string()
-    };
-    let base = if is_playing {
-        theme::strong()
-    } else if track.id.is_none() {
-        theme::dim()
-    } else {
-        theme::text()
-    };
-    let secondary = if is_playing {
-        theme::strong()
-    } else {
-        theme::soft()
+        let row = if track.id.is_none() {
+            theme::dim()
+        } else {
+            theme::text()
+        };
+        ((index + 1).to_string(), theme::dim(), theme::soft(), row)
     };
     Row::new(vec![
-        Cell::from(number).style(if is_playing {
-            theme::strong()
-        } else {
-            theme::dim()
-        }),
+        Cell::from(number).style(number_style),
         Cell::from(track.name.as_str()),
-        Cell::from(track.artists.as_str()).style(secondary),
+        Cell::from(track.artists.as_str()).style(artist_style),
         Cell::from(track.album.as_str()).style(theme::dim()),
         Cell::from(fmt_ms(track.duration_ms)).style(theme::dim()),
     ])
-    .style(base)
+    .style(row_style)
 }
 
 fn search_icon(kind: SearchKind) -> &'static str {
@@ -431,7 +425,7 @@ fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width < 2 || area.height < 2 {
         return;
     }
-    if app.cover.protocol_type().is_none() {
+    if !app.has_cover() {
         // Sin carátula (cargando o nada sonando): el logo de Spotify.
         let logo = Paragraph::new(logo_lines(&LOGO_SMALL)).alignment(Alignment::Center);
         let height = (LOGO_SMALL.len() as u16).min(area.height);
@@ -439,6 +433,7 @@ fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     // `Scale` amplía también las imágenes pequeñas para ocupar todo el hueco.
+    // Mientras se redimensiona no se dibuja nada (ni el logo, que parpadearía).
     let widget = StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle)));
     f.render_stateful_widget(widget, area, &mut app.cover);
 }
@@ -658,6 +653,7 @@ mod tests {
             album: album.into(),
             duration_ms: 215_000,
             id: Some(PlayableId::Track(TrackId::from_id(id.to_string()).unwrap())),
+            position: None,
         };
         app.playlists = vec![PlaylistEntry {
             id: PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string()).unwrap(),
@@ -708,8 +704,7 @@ mod tests {
         let (mut app, mut rx) = demo_app();
         // Carátula de prueba: degradado.
         let img = RgbImage::from_fn(64, 64, |x, y| Rgb([(x * 4) as u8, (y * 4) as u8, 120]));
-        let proto = app.picker.new_resize_protocol(DynamicImage::ImageRgb8(img));
-        app.cover.replace_protocol(proto);
+        app.set_cover_image(DynamicImage::ImageRgb8(img));
 
         let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -726,6 +721,35 @@ mod tests {
         assert!(text.contains("Reproduciendo"));
         assert!(text.contains("1:23 / 4:54"));
         // Los halfblocks dibujan la imagen con el carácter ▀/▄.
+        assert!(text.contains('▀') || text.contains('▄'));
+    }
+
+    /// Mientras la carátula se redimensiona no aparece el logo (parpadeo):
+    /// el logo es solo para cuando no hay carátula.
+    #[test]
+    fn resizing_cover_does_not_flash_the_logo() {
+        let (mut app, mut rx) = demo_app();
+        let logo_row = LOGO_SMALL[0].trim();
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains(logo_row),
+            "sin carátula, el logo"
+        );
+
+        let img = RgbImage::from_fn(64, 64, |x, y| Rgb([(x * 4) as u8, (y * 4) as u8, 120]));
+        app.set_cover_image(DynamicImage::ImageRgb8(img));
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let request = rx.try_recv().expect("debe pedirse un redimensionado");
+        // El redimensionado aún no ha vuelto.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains(logo_row));
+
+        app.cover
+            .update_resized_protocol(request.resize_encode().unwrap());
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains(logo_row));
         assert!(text.contains('▀') || text.contains('▄'));
     }
 
@@ -778,6 +802,7 @@ mod robustness {
             id: TrackId::from_id("4u7EnebtmKWzUH433cf5Qv".to_string())
                 .ok()
                 .map(PlayableId::Track),
+            position: None,
         }
     }
 
@@ -798,6 +823,61 @@ mod robustness {
             volume: Some(100),
             fetched_at: Instant::now() - Duration::from_millis(1),
         }
+    }
+
+    #[test]
+    fn is_current_track_compares_ids() {
+        let current = track("actual");
+        assert!(is_current_track(&current, Some("4u7EnebtmKWzUH433cf5Qv")));
+        assert!(!is_current_track(&current, Some("5ChkMS8OtdzJeqyybCc9R5")));
+        assert!(!is_current_track(&current, None));
+        // Una canción local (sin id) nunca es la actual.
+        let local = TrackEntry {
+            id: None,
+            ..track("local")
+        };
+        assert!(!is_current_track(&local, Some("4u7EnebtmKWzUH433cf5Qv")));
+    }
+
+    #[test]
+    fn track_row_styles_current_normal_and_local_tracks() {
+        let (current, normal) = (track("a"), track("b"));
+        let local = TrackEntry {
+            id: None,
+            ..track("c")
+        };
+        let rows = vec![
+            track_row(0, &current, true),
+            track_row(1, &normal, false),
+            track_row(2, &local, false),
+        ];
+        // Columnas: número (0..4), título (5..9), artista (10..14), ...
+        let widths = [Constraint::Length(4); 5];
+        let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+        terminal
+            .draw(|f| f.render_widget(Table::new(rows, widths), f.area()))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let fg = |x: u16, y: u16| Some(buf[(x, y)].fg);
+        let bold = |x: u16, y: u16| {
+            buf[(x, y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        };
+
+        // La canción actual: ♪ y todo en negrita.
+        assert_eq!(buf[(0, 0)].symbol(), "♪");
+        assert!(bold(0, 0) && bold(5, 0) && bold(10, 0));
+        assert_eq!(fg(10, 0), theme::strong().fg);
+        // Una canción normal: número tenue, título normal, artista suave.
+        assert_eq!(buf[(0, 1)].symbol(), "2");
+        assert!(!bold(0, 1) && !bold(5, 1));
+        assert_eq!(fg(0, 1), theme::dim().fg);
+        assert_eq!(fg(5, 1), theme::text().fg);
+        assert_eq!(fg(10, 1), theme::soft().fg);
+        // Una canción local (sin id): el título se atenúa.
+        assert_eq!(buf[(0, 2)].symbol(), "3");
+        assert_eq!(fg(5, 2), theme::dim().fg);
     }
 
     fn all_states(app: &mut App, step: usize) {
@@ -916,8 +996,7 @@ mod cover_robustness {
             app.picker.set_protocol_type(protocol);
             for (w, h) in [(1, 1), (3, 2), (300, 1), (1, 300), (64, 64)] {
                 let img = RgbImage::from_fn(w, h, |x, y| Rgb([x as u8, y as u8, 200]));
-                let proto = app.picker.new_resize_protocol(DynamicImage::ImageRgb8(img));
-                app.cover.replace_protocol(proto);
+                app.set_cover_image(DynamicImage::ImageRgb8(img));
                 for (width, height) in [(20, 14), (60, 20), (120, 40), (8, 12)] {
                     for big in [false, true] {
                         app.big_cover = big;

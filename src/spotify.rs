@@ -4,14 +4,14 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt, TryFutureExt, TryStreamExt};
 use rspotify::{
     AuthCodePkceSpotify, ClientError,
     http::HttpError,
     model::{
         AdditionalType, AlbumId, CurrentPlaybackContext, EpisodeId, FullTrack, Image, Market,
         Offset, Page, PlayableItem, PlaylistId, RepeatState, SearchResult, SearchType,
-        SimplifiedPlaylist, TrackId,
+        SimplifiedArtist, SimplifiedPlaylist, TrackId,
     },
     prelude::*,
 };
@@ -21,7 +21,7 @@ pub type Client = AuthCodePkceSpotify;
 
 /// Límite de resultados por búsqueda. Las apps en "Development mode" de
 /// Spotify aceptan como máximo 10 desde febrero de 2026.
-pub const SEARCH_LIMIT: u32 = 10;
+const SEARCH_LIMIT: u32 = 10;
 /// Máximo de URIs que se envían al reproducir una lista sin contexto.
 const MAX_URIS: usize = 100;
 
@@ -63,6 +63,9 @@ pub struct TrackEntry {
     pub album: String,
     pub duration_ms: u64,
     pub id: Option<PlayableId<'static>>,
+    /// Posición real en su playlist o álbum, si se conoce. Sirve para empezar
+    /// por la fila elegida cuando la canción aparece varias veces.
+    pub position: Option<u32>,
 }
 
 impl TrackEntry {
@@ -156,14 +159,18 @@ fn pick_image(images: &[Image]) -> Option<String> {
         .map(|i| i.url.clone())
 }
 
+/// Nombres de los artistas separados por comas.
+fn artist_names(artists: &[SimplifiedArtist]) -> String {
+    join_artists(artists.iter().map(|a| a.name.as_str()))
+}
+
+/// Duración en milisegundos; una negativa (no debería llegar) cuenta como 0.
+fn millis(d: chrono::Duration) -> u64 {
+    d.num_milliseconds().max(0) as u64
+}
+
 fn track_entry(t: &FullTrack) -> TrackEntry {
-    TrackEntry {
-        name: t.name.clone(),
-        artists: join_artists(t.artists.iter().map(|a| a.name.as_str())),
-        album: t.album.name.clone(),
-        duration_ms: t.duration.num_milliseconds().max(0) as u64,
-        id: t.id.clone().map(PlayableId::Track),
-    }
+    track_info(t).into()
 }
 
 /// Lo que la interfaz necesita de una canción o episodio, venga como venga.
@@ -176,25 +183,43 @@ struct ItemInfo {
     id: Option<PlayableId<'static>>,
 }
 
+impl From<ItemInfo> for TrackEntry {
+    fn from(info: ItemInfo) -> Self {
+        TrackEntry {
+            name: info.title,
+            artists: info.artists,
+            album: info.album,
+            duration_ms: info.duration_ms,
+            id: info.id,
+            position: None,
+        }
+    }
+}
+
+/// Información de una canción: la usan las listas y el estado de reproducción.
+fn track_info(t: &FullTrack) -> ItemInfo {
+    ItemInfo {
+        title: t.name.clone(),
+        artists: artist_names(&t.artists),
+        album: t.album.name.clone(),
+        cover_url: pick_image(&t.album.images),
+        duration_ms: millis(t.duration),
+        id: t.id.clone().map(PlayableId::Track),
+    }
+}
+
 /// Extrae la información de cualquier elemento reproducible. Si `rspotify` no
 /// lo entendió (`Unknown`, p. ej. porque Spotify cambió el formato), se lee el
 /// JSON crudo de forma tolerante en vez de descartarlo.
 fn item_info(item: &PlayableItem) -> Option<ItemInfo> {
     match item {
-        PlayableItem::Track(t) => Some(ItemInfo {
-            title: t.name.clone(),
-            artists: join_artists(t.artists.iter().map(|a| a.name.as_str())),
-            album: t.album.name.clone(),
-            cover_url: pick_image(&t.album.images),
-            duration_ms: t.duration.num_milliseconds().max(0) as u64,
-            id: t.id.clone().map(PlayableId::Track),
-        }),
+        PlayableItem::Track(t) => Some(track_info(t)),
         PlayableItem::Episode(e) => Some(ItemInfo {
             title: e.name.clone(),
             artists: e.show.name.clone(),
             album: "Podcast".into(),
             cover_url: pick_image(&e.images).or_else(|| pick_image(&e.show.images)),
-            duration_ms: e.duration.num_milliseconds().max(0) as u64,
+            duration_ms: millis(e.duration),
             id: Some(PlayableId::Episode(e.id.clone())),
         }),
         PlayableItem::Unknown(raw) => lenient_info(raw),
@@ -245,13 +270,7 @@ fn playable_id_from_uri(uri: &str) -> Option<PlayableId<'static>> {
 }
 
 fn playable_entry(item: &PlayableItem) -> Option<TrackEntry> {
-    item_info(item).map(|info| TrackEntry {
-        name: info.title,
-        artists: info.artists,
-        album: info.album,
-        duration_ms: info.duration_ms,
-        id: info.id,
-    })
+    item_info(item).map(Into::into)
 }
 
 fn playlist_entry(p: SimplifiedPlaylist) -> PlaylistEntry {
@@ -305,11 +324,17 @@ pub fn is_network_error(err: &ClientError) -> bool {
     matches!(err, ClientError::Http(http) if matches!(http.as_ref(), HttpError::Client(_)))
 }
 
+/// Aviso cuando no se puede hablar con Spotify (sin red, DNS...).
+const OFFLINE: &str = "sin conexión con Spotify: revisa tu red (se reintentará solo)";
+
 /// Qué tipo de petición falló: cambia el significado de algunos códigos.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Query,
     Player,
+    /// Canciones de una playlist: en modo desarrollo, Spotify solo las da
+    /// para las playlists del usuario o colaborativas (403 con el resto).
+    PlaylistItems,
 }
 
 /// Traduce un error de la API a un mensaje en español con una pista útil.
@@ -323,7 +348,7 @@ fn friendly(err: ClientError, kind: Kind) -> anyhow::Error {
             let message = if e.is_timeout() {
                 "Spotify no respondió a tiempo; se reintentará"
             } else {
-                "sin conexión con Spotify: revisa tu red (se reintentará solo)"
+                OFFLINE
             };
             return anyhow::Error::new(ApiError {
                 status: None,
@@ -335,18 +360,22 @@ fn friendly(err: ClientError, kind: Kind) -> anyhow::Error {
         _ => return anyhow!("error de red: {err}"),
     };
     let status = resp.status().as_u16();
-    let retry_after = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(Duration::from_secs);
+    let retry_after = retry_after(resp);
     let message = status_message(status, kind, retry_after);
     anyhow::Error::new(ApiError {
         status: Some(status),
         retry_after,
         message,
     })
+}
+
+/// Segundos que pide esperar la cabecera `Retry-After` de una respuesta.
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    resp.headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 fn status_message(status: u16, kind: Kind, retry_after: Option<Duration>) -> String {
@@ -359,15 +388,19 @@ fn status_message(status: u16, kind: Kind, retry_after: Option<Duration>) -> Str
                                 o la acción no está permitida ahora)"
                 .into()
         }
-        (403, Kind::Query) => "Spotify no permite este acceso a la app \
-                               (¿tu usuario está en «User Management» de la app?)"
+        (403, Kind::PlaylistItems) => {
+            "Spotify solo deja ver las canciones de tus playlists o de las colaborativas".into()
+        }
+        (403, _) => "Spotify no permite este acceso a la app (en modo desarrollo solo se \
+                     ven tus propias playlists; revisa también que tu usuario esté en \
+                     «User Management» de la app)"
             .into(),
         (404, Kind::Player) => {
             "no hay ningún dispositivo activo: abre Spotify en algún dispositivo \
                                 o pulsa 'd' para elegir uno"
                 .into()
         }
-        (404, Kind::Query) => "Spotify no encontró ese contenido".into(),
+        (404, _) => "Spotify no encontró ese contenido".into(),
         (429, _) => match retry_after {
             Some(d) => format!(
                 "demasiadas peticiones a Spotify, reintentando en {} s",
@@ -428,10 +461,7 @@ fn playback_from_context(ctx: CurrentPlaybackContext) -> Playback {
     };
     Playback {
         is_playing: ctx.is_playing,
-        progress_ms: ctx
-            .progress
-            .map(|p| p.num_milliseconds().max(0) as u64)
-            .unwrap_or(0),
+        progress_ms: ctx.progress.map(millis).unwrap_or(0),
         duration_ms,
         title,
         artists,
@@ -458,8 +488,9 @@ const MAX_SAVED_TRACKS: u32 = 1000;
 
 /// Descarga una lista paginada: primero la página 0 (que trae el total) y
 /// después el resto en paralelo, conservando el orden. Mucho más rápido que
-/// pedirlas una detrás de otra.
-async fn fetch_paged<T, F, Fut>(max_items: u32, fetch_page: F) -> Result<Vec<T>>
+/// pedirlas una detrás de otra. Cada página va con el desplazamiento con el
+/// que se pidió.
+async fn fetch_pages<T, F, Fut>(max_items: u32, fetch_page: F) -> Result<Vec<(u32, Page<T>)>>
 where
     F: Fn(u32) -> Fut,
     Fut: Future<Output = Result<Page<T>>>,
@@ -467,17 +498,50 @@ where
 {
     let first = fetch_page(0).await?;
     let wanted = first.total.min(max_items);
-    let mut items = first.items;
 
     let offsets = (PAGE_SIZE..wanted).step_by(PAGE_SIZE as usize);
-    let rest: Vec<Page<T>> = futures::stream::iter(offsets)
-        .map(fetch_page)
+    let rest: Vec<(u32, Page<T>)> = futures::stream::iter(offsets)
+        .map(|offset| fetch_page(offset).map_ok(move |page| (offset, page)))
         .buffered(PARALLEL_PAGES)
         .try_collect()
         .await?;
-    items.extend(rest.into_iter().flat_map(|page| page.items));
-    items.truncate(max_items as usize);
-    Ok(items)
+    Ok(std::iter::once((0, first)).chain(rest).collect())
+}
+
+/// Como [`fetch_pages`], pero solo los elementos, en orden.
+async fn fetch_paged<T, F, Fut>(max_items: u32, fetch_page: F) -> Result<Vec<T>>
+where
+    F: Fn(u32) -> Fut,
+    Fut: Future<Output = Result<Page<T>>>,
+    T: serde::de::DeserializeOwned,
+{
+    let pages = fetch_pages(max_items, fetch_page).await?;
+    Ok(pages
+        .into_iter()
+        .flat_map(|(_, page)| page.items)
+        .take(max_items as usize)
+        .collect())
+}
+
+/// Los elementos de las páginas con su posición real en la lista. Spotify
+/// omite los elementos nulos sin avisar: si a una página le falta alguno,
+/// las posiciones de esa página no son fiables y quedan en `None`.
+fn with_positions<T>(pages: Vec<(u32, Page<T>)>, max_items: u32) -> Vec<(Option<u32>, T)>
+where
+    T: serde::de::DeserializeOwned,
+{
+    pages
+        .into_iter()
+        .flat_map(|(offset, page)| {
+            let expected = page.total.saturating_sub(offset).min(PAGE_SIZE);
+            let exact = page.items.len() == expected as usize;
+            page.items.into_iter().enumerate().map(move |(i, item)| {
+                let position = offset.checked_add(i as u32).filter(|_| exact);
+                (position, item)
+            })
+        })
+        .take(max_items as usize)
+        .collect()
 }
 
 pub async fn playlists(sp: &Client) -> Result<Vec<PlaylistEntry>> {
@@ -492,7 +556,7 @@ pub async fn playlists(sp: &Client) -> Result<Vec<PlaylistEntry>> {
 
 pub async fn playlist_tracks(sp: &Client, id: PlaylistId<'static>) -> Result<Vec<TrackEntry>> {
     let id = &id;
-    let items = fetch_paged(MAX_PLAYLIST_TRACKS, |offset| async move {
+    let pages = fetch_pages(MAX_PLAYLIST_TRACKS, |offset| async move {
         sp.playlist_items_manual(
             id.as_ref(),
             None,
@@ -501,12 +565,16 @@ pub async fn playlist_tracks(sp: &Client, id: PlaylistId<'static>) -> Result<Vec
             Some(offset),
         )
         .await
-        .friendly()
+        .map_err(|e| friendly(e, Kind::PlaylistItems))
     })
     .await?;
-    Ok(items
-        .iter()
-        .filter_map(|i| i.item.as_ref().and_then(playable_entry))
+    // La posición se calcula antes de descartar los elementos ilegibles.
+    Ok(with_positions(pages, MAX_PLAYLIST_TRACKS)
+        .into_iter()
+        .filter_map(|(position, i)| {
+            let entry = i.item.as_ref().and_then(playable_entry)?;
+            Some(TrackEntry { position, ..entry })
+        })
         .collect())
 }
 
@@ -522,12 +590,14 @@ pub async fn album_tracks(
         .friendly()?;
     Ok(items
         .into_iter()
-        .map(|t| TrackEntry {
-            name: t.name,
-            artists: join_artists(t.artists.iter().map(|a| a.name.as_str())),
+        .enumerate()
+        .map(|(i, t)| TrackEntry {
+            artists: artist_names(&t.artists),
             album: album_name.to_string(),
-            duration_ms: t.duration.num_milliseconds().max(0) as u64,
+            duration_ms: millis(t.duration),
+            name: t.name,
             id: t.id.map(PlayableId::Track),
+            position: u32::try_from(i).ok(),
         })
         .collect())
 }
@@ -587,7 +657,7 @@ pub async fn search(sp: &Client, query: &str, kind: SearchKind) -> Result<Search
                         .release_date
                         .as_deref()
                         .map(|d| d.chars().take(4).collect::<String>());
-                    let artists = join_artists(a.artists.iter().map(|x| x.name.as_str()));
+                    let artists = artist_names(&a.artists);
                     Some(ContextEntry {
                         detail: match year {
                             Some(y) if !y.is_empty() => format!("{artists} · {y}"),
@@ -678,7 +748,7 @@ pub enum Action {
     /// Reproduce una playlist/álbum/artista, opcionalmente desde una canción.
     PlayContext {
         context: PlayContextId<'static>,
-        start_uri: Option<String>,
+        start: Option<ContextStart>,
     },
     /// Reproduce una lista de canciones sin contexto (me gusta, recientes, búsqueda).
     PlayTracks {
@@ -689,6 +759,27 @@ pub enum Action {
     Transfer {
         device_id: String,
     },
+}
+
+/// Canción por la que empieza a sonar un contexto (playlist o álbum).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextStart {
+    /// La primera aparición de esta URI en el contexto.
+    Uri(String),
+    /// Una posición exacta (para canciones que aparecen varias veces).
+    Position(u32),
+}
+
+impl ContextStart {
+    fn offset(self) -> Offset {
+        match self {
+            ContextStart::Uri(uri) => Offset::Uri(uri),
+            // rspotify envía los milisegundos de este `Duration` como posición.
+            ContextStart::Position(position) => {
+                Offset::Position(chrono::Duration::milliseconds(i64::from(position)))
+            }
+        }
+    }
 }
 
 impl Action {
@@ -732,8 +823,8 @@ pub async fn perform(sp: &Client, action: Action) -> Result<()> {
         Action::Volume(v) => sp.volume(v, None).await,
         Action::Shuffle(state) => sp.shuffle(state, None).await,
         Action::Repeat(state) => sp.repeat(state, None).await,
-        Action::PlayContext { context, start_uri } => {
-            sp.start_context_playback(context, None, start_uri.map(Offset::Uri), None)
+        Action::PlayContext { context, start } => {
+            sp.start_context_playback(context, None, start.map(ContextStart::offset), None)
                 .await
         }
         Action::PlayTracks { tracks, start } => {
@@ -758,10 +849,16 @@ fn uri_window(len: usize, start: usize, max: usize) -> (usize, usize) {
     (from, (from + max).min(len))
 }
 
-async fn token_is_valid(sp: &Client) -> bool {
-    match sp.token.lock().await {
-        Ok(token) => token.as_ref().is_some_and(|t| !t.is_expired()),
-        Err(_) => false,
+/// Guarda en disco el token que hay en memoria (rspotify no lo hace: la caché
+/// de `token.json` la gestiona [`crate::config::save_token`]).
+pub async fn save_session(sp: &Client) -> Result<()> {
+    let token = match sp.token.lock().await {
+        Ok(token) => token.clone(),
+        Err(_) => None,
+    };
+    match token {
+        Some(token) => crate::config::save_token(&sp.config.cache_path, &token),
+        None => Ok(()),
     }
 }
 
@@ -769,26 +866,117 @@ async fn token_is_valid(sp: &Client) -> bool {
 const REFRESH_RETRY_REJECTED: Duration = Duration::from_secs(30);
 /// Espera tras un fallo de red al renovar la sesión.
 const REFRESH_RETRY_OFFLINE: Duration = Duration::from_secs(10);
+/// Espera tras un fallo pasajero de Spotify al renovar (5xx, respuesta rara).
+const REFRESH_RETRY_TRANSIENT: Duration = Duration::from_secs(15);
+/// Espera máxima que se acepta del `Retry-After` de un 429.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 
 /// Mensaje cuando Spotify no acepta renovar la sesión (token revocado, etc.).
-pub const SESSION_EXPIRED: &str = "La sesión de Spotify caducó y no se pudo renovar: \
+const SESSION_EXPIRED: &str = "La sesión de Spotify caducó y no se pudo renovar: \
      sal con q y ejecuta `spotify_cmd --logout` para volver a entrar";
+/// Mensaje cuando Spotify falla al renovar pero la sesión sigue siendo válida.
+const REFRESH_TROUBLE: &str = "Spotify tiene problemas para renovar la sesión; se reintentará solo";
+
+/// Por qué falló la renovación del token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFailure {
+    /// No se pudo hablar con Spotify (sin red, DNS, tiempo agotado).
+    Offline,
+    /// Spotify rechazó el refresh token (revocado o ya usado): hay que volver
+    /// a iniciar sesión.
+    Rejected,
+    /// Fallo pasajero de Spotify (5xx, 429...): el refresh token sigue
+    /// valiendo y se reintenta tras la espera indicada.
+    Transient(Duration),
+}
+
+impl RefreshFailure {
+    /// Clasifica el error de una renovación.
+    pub fn of(err: &ClientError) -> Self {
+        if is_network_error(err) {
+            return RefreshFailure::Offline;
+        }
+        match error_response(err) {
+            Some(resp) => Self::from_status(resp.status().as_u16(), retry_after(resp)),
+            // Una respuesta ilegible no demuestra que la sesión no valga.
+            None => RefreshFailure::Transient(REFRESH_RETRY_TRANSIENT),
+        }
+    }
+
+    /// Solo un 400 o un 401 (`invalid_grant`, `invalid_client`) rechazan el
+    /// refresh token. Un 429 espera lo que pida Spotify (con tope) y el resto
+    /// (5xx...) se trata como un fallo pasajero.
+    fn from_status(status: u16, retry_after: Option<Duration>) -> Self {
+        match status {
+            400 | 401 => RefreshFailure::Rejected,
+            429 => RefreshFailure::Transient(
+                retry_after
+                    .unwrap_or(REFRESH_RETRY_TRANSIENT)
+                    .min(MAX_RETRY_AFTER),
+            ),
+            _ => RefreshFailure::Transient(REFRESH_RETRY_TRANSIENT),
+        }
+    }
+
+    /// Cuánto esperar antes de reintentar y qué avisar mientras tanto.
+    fn retry(self) -> (Duration, &'static str) {
+        match self {
+            RefreshFailure::Offline => (REFRESH_RETRY_OFFLINE, OFFLINE),
+            RefreshFailure::Rejected => (REFRESH_RETRY_REJECTED, SESSION_EXPIRED),
+            RefreshFailure::Transient(wait) => (wait, REFRESH_TROUBLE),
+        }
+    }
+}
+
+/// Respuesta de Spotify con código de error, si la hubo.
+fn error_response(err: &ClientError) -> Option<&reqwest::Response> {
+    match err {
+        ClientError::Http(http) => match http.as_ref() {
+            HttpError::StatusCode(resp) => Some(resp),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+async fn token_is_valid(sp: &Client) -> bool {
+    match sp.token.lock().await {
+        Ok(token) => token.as_ref().is_some_and(|t| !t.is_expired()),
+        Err(_) => false,
+    }
+}
+
+/// Refresh token que hay en memoria.
+async fn refresh_token_in_memory(sp: &Client) -> Option<String> {
+    match sp.token.lock().await {
+        Ok(token) => token.as_ref().and_then(|t| t.refresh_token.clone()),
+        Err(_) => None,
+    }
+}
+
+async fn set_token(sp: &Client, token: rspotify::Token) {
+    if let Ok(mut slot) = sp.token.lock().await {
+        *slot = Some(token);
+    }
+}
+
+/// Próximo reintento permitido tras un fallo al renovar y el aviso que se da
+/// hasta entonces.
+type RetryGate = tokio::sync::Mutex<Option<(Instant, &'static str)>>;
 
 /// Renueva el token si ha caducado, de uno en uno. Con PKCE cada refresh token
 /// solo sirve una vez, así que varias tareas renovándolo a la vez fallarían.
 ///
 /// Si la renovación falla, no se reintenta en cada petición: se espera un
-/// rato ([`REFRESH_RETRY_REJECTED`] o [`REFRESH_RETRY_OFFLINE`]).
+/// rato (según [`RefreshFailure`]).
 pub async fn ensure_token(sp: &Client) -> Result<()> {
-    static LOCK: tokio::sync::Mutex<Option<(Instant, &'static str)>> =
-        tokio::sync::Mutex::const_new(None);
-    let mut retry = LOCK.lock().await;
+    static RETRY: RetryGate = tokio::sync::Mutex::const_new(None);
+    ensure_token_with(sp, &RETRY).await
+}
 
-    let expired = match sp.token.lock().await {
-        Ok(token) => token.as_ref().is_none_or(|t| t.is_expired()),
-        Err(_) => false,
-    };
-    if !expired {
+async fn ensure_token_with(sp: &Client, gate: &RetryGate) -> Result<()> {
+    let mut retry = gate.lock().await;
+    if token_is_valid(sp).await {
         *retry = None;
         return Ok(());
     }
@@ -797,34 +985,61 @@ pub async fn ensure_token(sp: &Client) -> Result<()> {
     {
         anyhow::bail!(reason);
     }
-    match sp.refresh_token().await {
+    match refresh_session(sp).await {
         Ok(()) => {
             *retry = None;
+            // Si no se puede guardar en disco (disco lleno, permisos), la app
+            // sigue con el token en memoria; solo habrá que volver a entrar la
+            // próxima vez que se abra.
+            let _ = save_session(sp).await;
             Ok(())
         }
-        // El token se renovó en memoria pero no se pudo guardar en disco (disco
-        // lleno, permisos): la app sigue funcionando con normalidad.
-        Err(_) if token_is_valid(sp).await => {
-            *retry = None;
-            Ok(())
-        }
-        Err(e) => {
-            let (wait, reason) = if is_network_error(&e) {
-                (
-                    REFRESH_RETRY_OFFLINE,
-                    "sin conexión con Spotify: revisa tu red (se reintentará solo)",
-                )
-            } else {
-                (REFRESH_RETRY_REJECTED, SESSION_EXPIRED)
-            };
+        Err(failure) => {
+            let (wait, reason) = failure.retry();
             *retry = Some((Instant::now() + wait, reason));
             anyhow::bail!(reason)
         }
     }
 }
 
+/// Renueva el token. Si Spotify rechaza el refresh token, puede que otra
+/// instancia de la app ya lo usara y guardara uno nuevo en `token.json`: en
+/// ese caso se adopta el del disco antes de dar la sesión por perdida.
+async fn refresh_session(sp: &Client) -> Result<(), RefreshFailure> {
+    let failure = match sp.refresh_token().await {
+        Ok(()) => return Ok(()),
+        Err(e) => RefreshFailure::of(&e),
+    };
+    if failure != RefreshFailure::Rejected {
+        return Err(failure);
+    }
+    adopt_saved_token(sp).await
+}
+
+/// Usa el token de `token.json` si su refresh token es distinto del que hay
+/// en memoria: tal cual si sigue vigente o, si ha caducado, renovándolo una
+/// sola vez más.
+async fn adopt_saved_token(sp: &Client) -> Result<(), RefreshFailure> {
+    let saved = crate::config::load_token(&sp.config.cache_path, &sp.oauth.scopes)
+        .filter(|t| t.refresh_token.is_some())
+        .ok_or(RefreshFailure::Rejected)?;
+    if saved.refresh_token == refresh_token_in_memory(sp).await {
+        return Err(RefreshFailure::Rejected);
+    }
+    let expired = saved.is_expired();
+    set_token(sp, saved).await;
+    if !expired {
+        return Ok(());
+    }
+    sp.refresh_token().await.map_err(|e| RefreshFailure::of(&e))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     fn page(items: Vec<u32>, total: u32) -> Page<u32> {
@@ -870,6 +1085,57 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Página de `items` pedida en `offset`, de una lista de `total` elementos.
+    fn page_at(offset: u32, items: Vec<u32>, total: u32) -> (u32, Page<u32>) {
+        (
+            offset,
+            Page {
+                offset,
+                ..page(items, total)
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_pages_keep_the_requested_offsets() {
+        let pages = fetch_pages(1000, |o| fake_page(o, 120)).await.unwrap();
+        let offsets: Vec<u32> = pages.iter().map(|(o, _)| *o).collect();
+        assert_eq!(offsets, vec![0, 50, 100]);
+        let positions = with_positions(pages, 1000);
+        assert_eq!(positions.len(), 120);
+        assert!(positions.iter().all(|(p, item)| *p == Some(*item)));
+    }
+
+    /// Si Spotify omitió un elemento nulo de una página, sus posiciones dejan
+    /// de ser fiables; las de las demás páginas se conservan.
+    #[test]
+    fn positions_of_a_page_with_missing_items_are_unknown() {
+        let total = 60;
+        let first: Vec<u32> = (0..50).filter(|n| *n != 7).collect();
+        let pages = vec![
+            page_at(0, first, total),
+            page_at(50, (50..60).collect(), total),
+        ];
+        let positions = with_positions(pages, 1000);
+        assert_eq!(positions.len(), 59);
+        assert!(positions[..49].iter().all(|(p, _)| p.is_none()));
+        assert_eq!(positions[49], (Some(50), 50));
+        assert_eq!(positions[58], (Some(59), 59));
+        // El límite se respeta.
+        let capped = with_positions(vec![page_at(0, (0..50).collect(), 50)], 10);
+        assert_eq!(capped.len(), 10);
+    }
+
+    #[test]
+    fn context_start_becomes_the_right_offset() {
+        let uri = "spotify:track:4u7EnebtmKWzUH433cf5Qv".to_string();
+        assert_eq!(ContextStart::Uri(uri.clone()).offset(), Offset::Uri(uri));
+        assert_eq!(
+            ContextStart::Position(39).offset(),
+            Offset::Position(chrono::Duration::milliseconds(39))
+        );
+    }
+
     #[test]
     fn uri_window_contains_start_and_fills_up() {
         assert_eq!(uri_window(10, 3, 100), (0, 10));
@@ -913,6 +1179,292 @@ mod tests {
         assert!(status_message(404, Kind::Player, None).contains("dispositivo"));
         assert!(!status_message(404, Kind::Query, None).contains("dispositivo"));
         assert!(status_message(429, Kind::Query, Some(Duration::from_secs(7))).contains("7 s"));
+    }
+
+    /// Un 403 al pedir las canciones de una playlist ajena no culpa a la
+    /// configuración de la app; el resto de códigos se explican igual.
+    #[test]
+    fn playlist_items_explain_foreign_playlists() {
+        let foreign = status_message(403, Kind::PlaylistItems, None);
+        assert!(foreign.contains("tus playlists") && !foreign.contains("User Management"));
+        assert_ne!(status_message(403, Kind::Query, None), foreign);
+        assert_eq!(
+            status_message(404, Kind::PlaylistItems, None),
+            status_message(404, Kind::Query, None)
+        );
+    }
+
+    #[test]
+    fn durations_never_go_negative() {
+        assert_eq!(millis(chrono::Duration::milliseconds(-5)), 0);
+        assert_eq!(millis(chrono::Duration::milliseconds(1500)), 1500);
+    }
+
+    /// Solo un 400/401 de accounts.spotify.com significa que hay que volver a
+    /// entrar; una caída (5xx) o un 429 se reintentan solos.
+    #[test]
+    fn refresh_failures_are_classified_by_status() {
+        let transient = RefreshFailure::Transient(REFRESH_RETRY_TRANSIENT);
+        assert_eq!(
+            RefreshFailure::from_status(400, None),
+            RefreshFailure::Rejected
+        );
+        assert_eq!(
+            RefreshFailure::from_status(401, None),
+            RefreshFailure::Rejected
+        );
+        assert_eq!(RefreshFailure::from_status(500, None), transient);
+        assert_eq!(RefreshFailure::from_status(503, None), transient);
+        assert_eq!(RefreshFailure::from_status(429, None), transient);
+        assert_eq!(
+            RefreshFailure::from_status(429, Some(Duration::from_secs(7))),
+            RefreshFailure::Transient(Duration::from_secs(7))
+        );
+        assert_eq!(
+            RefreshFailure::from_status(429, Some(Duration::from_secs(3600))),
+            RefreshFailure::Transient(MAX_RETRY_AFTER)
+        );
+        // Un error que no es una respuesta de Spotify no demuestra nada.
+        assert_eq!(RefreshFailure::of(&ClientError::InvalidToken), transient);
+
+        assert!(RefreshFailure::Rejected.retry().1.contains("--logout"));
+        assert!(!transient.retry().1.contains("--logout"));
+        assert!(!RefreshFailure::Offline.retry().1.contains("--logout"));
+    }
+
+    // -- Renovación del token contra un servidor de tokens de prueba --------
+
+    /// Peticiones recibidas por el servidor de tokens de prueba (sus cuerpos).
+    type Requests = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn http_response(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn rejected() -> String {
+        http_response("400 Bad Request", "", r#"{"error":"invalid_grant"}"#)
+    }
+
+    fn renewed() -> String {
+        let body = r#"{"access_token":"renovado","token_type":"Bearer","expires_in":3600,"refresh_token":"r2","scope":""}"#;
+        http_response("200 OK", "", body)
+    }
+
+    /// Lee una petición HTTP completa y devuelve su cuerpo.
+    async fn read_body(stream: &mut tokio::net::TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                return String::new();
+            }
+            data.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&data).into_owned();
+            let Some(end) = text.find("\r\n\r\n") else {
+                continue;
+            };
+            let len = text[..end]
+                .lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + len {
+                return String::from_utf8_lossy(&data[end + 4..]).into_owned();
+            }
+        }
+    }
+
+    /// Imita accounts.spotify.com: responde a cada petición con la siguiente
+    /// respuesta de la lista (la última se repite). Devuelve su URL.
+    async fn token_server(responses: Vec<String>) -> (String, Requests) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Requests::default();
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = read_body(&mut stream).await;
+                let n = {
+                    let mut seen = seen.lock().unwrap();
+                    seen.push(body);
+                    seen.len()
+                };
+                let response = &responses[(n - 1).min(responses.len() - 1)];
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (url, requests)
+    }
+
+    fn session_token(access: &str, refresh: &str, valid: bool) -> rspotify::Token {
+        rspotify::Token {
+            access_token: access.into(),
+            refresh_token: Some(refresh.into()),
+            expires_at: valid.then(|| chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..Default::default()
+        }
+    }
+
+    /// Cliente con un token caducado (refresh token `r0`) en memoria, que
+    /// renueva contra `auth_url` y guarda la sesión en un directorio propio.
+    async fn expired_session(name: &str, auth_url: &str) -> (Client, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("spotify_cmd_test_{}_{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = rspotify::Config {
+            token_cached: false,
+            token_refreshing: false,
+            cache_path: dir.join("token.json"),
+            auth_base_url: auth_url.into(),
+            ..Default::default()
+        };
+        let sp = Client::with_config(Default::default(), Default::default(), config);
+        set_token(&sp, session_token("viejo", "r0", false)).await;
+        (sp, dir)
+    }
+
+    async fn access_token(sp: &Client) -> Option<String> {
+        sp.token
+            .lock()
+            .await
+            .unwrap()
+            .as_ref()
+            .map(|t| t.access_token.clone())
+    }
+
+    /// Una caída de accounts.spotify.com no da la sesión por perdida: avisa
+    /// de que se reintentará y no insiste en cada petición.
+    #[tokio::test]
+    async fn server_errors_while_refreshing_are_transient() {
+        let down = http_response("503 Service Unavailable", "", "");
+        let (url, requests) = token_server(vec![down]).await;
+        let (sp, dir) = expired_session("refresh_503", &url).await;
+        let gate = RetryGate::const_new(None);
+
+        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        assert_eq!(err, REFRESH_TROUBLE);
+        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        assert_eq!(err, REFRESH_TROUBLE);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "espera antes de reintentar"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ante un 429 se espera lo que indique `Retry-After`.
+    #[tokio::test]
+    async fn rate_limited_refresh_waits_retry_after() {
+        let busy = http_response("429 Too Many Requests", "retry-after: 60\r\n", "");
+        let (url, _requests) = token_server(vec![busy]).await;
+        let (sp, dir) = expired_session("refresh_429", &url).await;
+        let gate = RetryGate::const_new(None);
+
+        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        assert!(!err.contains("--logout"));
+        let (at, _) = gate.lock().await.unwrap();
+        assert!(at > Instant::now() + Duration::from_secs(50));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spotify rechaza el refresh token y no hay otro en disco: hay que
+    /// volver a entrar.
+    #[tokio::test]
+    async fn rejected_refresh_expires_the_session() {
+        let (url, requests) = token_server(vec![rejected()]).await;
+        let (sp, dir) = expired_session("refresh_rejected", &url).await;
+        // En disco está el mismo refresh token que en memoria.
+        crate::config::save_token(&sp.config.cache_path, &session_token("viejo", "r0", false))
+            .unwrap();
+        let gate = RetryGate::const_new(None);
+
+        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        assert_eq!(err, SESSION_EXPIRED);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Otra instancia ya renovó (el refresh token de memoria ya no vale) y
+    /// guardó en disco un token vigente: se adopta sin pedir nada más.
+    #[tokio::test]
+    async fn adopts_valid_token_saved_by_another_instance() {
+        let (url, requests) = token_server(vec![rejected()]).await;
+        let (sp, dir) = expired_session("adopt_valid", &url).await;
+        crate::config::save_token(
+            &sp.config.cache_path,
+            &session_token("de-disco", "r1", true),
+        )
+        .unwrap();
+        let gate = RetryGate::const_new(None);
+
+        ensure_token_with(&sp, &gate).await.unwrap();
+        assert_eq!(access_token(&sp).await.as_deref(), Some("de-disco"));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// El token del disco también caducó: se renueva una vez con su refresh
+    /// token y el resultado se guarda.
+    #[tokio::test]
+    async fn renews_with_refresh_token_saved_by_another_instance() {
+        let (url, requests) = token_server(vec![rejected(), renewed()]).await;
+        let (sp, dir) = expired_session("adopt_expired", &url).await;
+        crate::config::save_token(
+            &sp.config.cache_path,
+            &session_token("de-disco", "r1", false),
+        )
+        .unwrap();
+        let gate = RetryGate::const_new(None);
+
+        ensure_token_with(&sp, &gate).await.unwrap();
+        assert_eq!(access_token(&sp).await.as_deref(), Some("renovado"));
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("refresh_token=r0"));
+        assert!(requests[1].contains("refresh_token=r1"));
+        let saved = crate::config::load_token(&sp.config.cache_path, &Default::default()).unwrap();
+        assert_eq!(saved.access_token, "renovado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// El token renovado en memoria se guarda en la ruta de la configuración.
+    #[tokio::test]
+    async fn save_session_writes_the_token_in_memory() {
+        let dir = std::env::temp_dir().join(format!(
+            "spotify_cmd_test_{}_save_session",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.json");
+        let config = rspotify::Config {
+            token_cached: false,
+            cache_path: path.clone(),
+            ..Default::default()
+        };
+        let sp = Client::with_config(Default::default(), Default::default(), config);
+
+        // Sin token en memoria no se escribe nada.
+        save_session(&sp).await.unwrap();
+        assert!(!path.exists());
+
+        *sp.token.lock().await.unwrap() = Some(rspotify::Token {
+            access_token: "renovado".into(),
+            ..Default::default()
+        });
+        save_session(&sp).await.unwrap();
+        let saved = crate::config::load_token(&path, &Default::default()).unwrap();
+        assert_eq!(saved.access_token, "renovado");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1013,6 +1565,24 @@ mod real_api {
         assert!(
             nulls.items.is_empty(),
             "los null de Spotify se ignoran sin fallar"
+        );
+    }
+
+    /// Una canción se convierte igual venga sola o como elemento reproducible.
+    #[test]
+    fn track_conversions_agree() {
+        let track: FullTrack = load(TRACK);
+        let single = track_entry(&track);
+        let item = playable_entry(&PlayableItem::Track(track)).unwrap();
+        assert_eq!(single.uri(), item.uri());
+        assert_eq!(
+            (
+                single.name,
+                single.artists,
+                single.album,
+                single.duration_ms
+            ),
+            (item.name, item.artists, item.album, item.duration_ms)
         );
     }
 

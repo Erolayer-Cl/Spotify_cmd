@@ -470,16 +470,18 @@ const FOOTER_KEYS: [(&str, &str); 11] = [
 ];
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let line = match app.visible_status() {
-        Some(status) => {
-            let style = if status.error {
-                theme::error()
-            } else {
-                theme::strong()
-            };
-            Line::styled(format!(" {}", status.text), style)
-        }
-        None => Line::from_iter(FOOTER_KEYS.iter().flat_map(|(k, v)| theme::key_hint(k, v))),
+    // Prioridad: aviso reciente → problema de sesión (persistente) → atajos.
+    let line = if let Some(status) = app.visible_status() {
+        let style = if status.error {
+            theme::error()
+        } else {
+            theme::strong()
+        };
+        Line::styled(format!(" {}", status.text), style)
+    } else if let Some(problem) = app.session_problem() {
+        Line::styled(format!(" {problem}"), theme::error())
+    } else {
+        Line::from_iter(FOOTER_KEYS.iter().flat_map(|(k, v)| theme::key_hint(k, v)))
     };
     f.render_widget(Paragraph::new(line), area);
 }

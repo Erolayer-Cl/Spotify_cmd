@@ -60,6 +60,6 @@ Ten Spotify abierto en algún dispositivo (móvil, PC…): esta herramienta es u
 ## Pruebas
 
 ```bash
-cargo test                  # 25 pruebas unitarias (incluye UI en todos los tamaños y 5000 teclas al azar)
-tests/e2e/run_all.sh        # app real contra una API de Spotify simulada: funcional, caos y velocidad (requiere `pip install pyte`)
+cargo test                  # 29 pruebas: UI en todos los tamaños, 5000 teclas al azar, respuestas reales de Spotify
+tests/e2e/run_all.sh        # app real contra una API simulada: funcional, red caída, token, caos, velocidad y memoria (requiere `pip install pyte`)
 ```

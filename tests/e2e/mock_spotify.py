@@ -7,6 +7,9 @@ PORT = int(sys.argv[1]); LOG = sys.argv[2]
 CHAOS = len(sys.argv) > 3 and sys.argv[3] == "chaos"
 BIG = len(sys.argv) > 3 and sys.argv[3] == "big"
 SAVED_TOTAL = 5000 if BIG else 120
+REFRESH_FAILS = len(sys.argv) > 3 and sys.argv[3] == "refresh_fails"
+SCOPES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
+          "playlist-read-private playlist-read-collaborative user-library-read user-read-recently-played")
 import random; rng = random.Random(7)
 BASE = f"http://127.0.0.1:{PORT}"
 lock = threading.Lock()
@@ -74,7 +77,8 @@ class H(BaseHTTPRequestHandler):
         self.send_response(204); self.send_header("content-length", "0"); self.end_headers()
     def record(self, body=b""):
         with lock, open(LOG, "a") as f:
-            f.write(f"{self.command} {self.path} {body.decode(errors='replace')}\n")
+            auth = self.headers.get("authorization", "")
+            f.write(f"{self.command} {self.path} {body.decode(errors='replace')} [{auth}]\n")
     def chaos(self):
         """Devuelve True si ya respondió con un fallo simulado."""
         if not CHAOS or self.path.startswith("/img/x"):
@@ -105,8 +109,22 @@ class H(BaseHTTPRequestHandler):
             return False
         return True
 
+    def token_expired(self):
+        """Como Spotify: un token caducado recibe 401. Los tokens de prueba
+        "exp-<segundos epoch>" caducan en ese instante."""
+        auth = self.headers.get("authorization", "")
+        if auth.startswith("Bearer exp-"):
+            try:
+                if time.time() > int(auth.split("exp-", 1)[1]):
+                    self.send_json({"error": {"status": 401, "message": "The access token expired"}}, 401)
+                    return True
+            except ValueError:
+                pass
+        return False
+
     def do_GET(self):
         self.record()
+        if not self.path.startswith("/img/") and self.token_expired(): return
         if self.chaos(): return
         u = urlparse(self.path); q = {k: v[0] for k, v in parse_qs(u.query).items()}
         off = int(q.get("offset", 0)); lim = int(q.get("limit", 50))
@@ -141,6 +159,12 @@ class H(BaseHTTPRequestHandler):
         self.record(body)
         if self.chaos(): return
         p = urlparse(self.path).path
+        if p != "/api/token" and self.token_expired(): return
+        if p == "/api/token":  # renovación del token (accounts.spotify.com)
+            if REFRESH_FAILS:
+                return self.send_json({"error": "invalid_grant", "error_description": "Refresh token revoked"}, 400)
+            return self.send_json({"access_token": "renovado", "token_type": "Bearer", "expires_in": 3600,
+                                   "refresh_token": "r2", "scope": SCOPES})
         if p == "/v1/me/player/pause": state["playing"] = False
         elif p == "/v1/me/player/play": state["playing"] = True
         elif p == "/v1/me/player/next": state["track"] += 1

@@ -1,0 +1,11 @@
+{
+  "href": "https://api.spotify.com/v1/search?offset=17&limit=2&query=My%20Playlist&type=playlist&market=FR",
+  "items": [
+    null
+  ],
+  "limit": 20,
+  "next": null,
+  "offset": 0,
+  "previous": null,
+  "total": 1
+}

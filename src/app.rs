@@ -61,6 +61,8 @@ pub enum Msg {
     /// Una tarea en segundo plano falló de forma inesperada (*panic*). La
     /// aplicación lo muestra y sigue funcionando.
     Crashed(String),
+    /// La sesión no se pudo renovar (token revocado o sin red).
+    SessionProblem(String),
 }
 
 /// Lanza una tarea que siempre responde con un mensaje: si la tarea sufre un
@@ -190,6 +192,7 @@ pub struct App {
 
     pending_seek: Debounced<u64>,
     pending_volume: Debounced<u8>,
+    session_problem: Option<String>,
 }
 
 /// Espera sin cambios antes de enviar un valor agrupado.
@@ -262,6 +265,7 @@ impl App {
             status: None,
             pending_seek: Debounced::default(),
             pending_volume: Debounced::default(),
+            session_problem: None,
         }
     }
 
@@ -287,8 +291,13 @@ impl App {
         Fut: Future<Output = Msg> + Send + 'static,
     {
         let sp = self.spotify.clone();
+        let tx = self.tx.clone();
         spawn_guarded(self.tx.clone(), async move {
-            spotify::ensure_token(&sp).await;
+            // Si la sesión no se pudo renovar, se avisa (la petición sigue y
+            // fallará con su propio mensaje, sin bloquear la interfaz).
+            if let Err(e) = spotify::ensure_token(&sp).await {
+                let _ = tx.send(Msg::SessionProblem(e.to_string()));
+            }
             f(sp).await
         });
     }
@@ -357,6 +366,11 @@ impl App {
             error,
             at: Instant::now(),
         });
+    }
+
+    /// Último problema de sesión pendiente (se borra cuando una petición va bien).
+    pub fn session_problem(&self) -> Option<&str> {
+        self.session_problem.as_deref()
     }
 
     pub fn visible_status(&self) -> Option<&Status> {
@@ -687,7 +701,10 @@ impl App {
             Msg::Playback(result) => {
                 self.playback_inflight = false;
                 match result {
-                    Ok(pb) => self.set_playback(pb),
+                    Ok(pb) => {
+                        self.session_problem = None;
+                        self.set_playback(pb);
+                    }
                     Err(e) => {
                         self.note_rate_limit(&e);
                         self.set_status(format!("Error al consultar la reproducción: {e}"), true);
@@ -808,6 +825,10 @@ impl App {
                 Err(e) => self.set_status(format!("Error al dibujar la carátula: {e}"), true),
             },
             Msg::Crashed(reason) => self.recover_from_crash(&reason),
+            Msg::SessionProblem(reason) => {
+                self.session_problem = Some(reason.clone());
+                self.set_status(reason, true);
+            }
         }
     }
 

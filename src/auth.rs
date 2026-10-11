@@ -35,7 +35,10 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     };
     let mut rs_config = rspotify::Config {
         token_cached: true,
-        token_refreshing: true,
+        // Las renovaciones las hace solo `spotify::ensure_token`, de una en una
+        // y esperando tras un fallo. Si rspotify también renovara por su
+        // cuenta, un token revocado provocaría un intento por cada petición.
+        token_refreshing: false,
         cache_path: config::token_path()?,
         ..Default::default()
     };

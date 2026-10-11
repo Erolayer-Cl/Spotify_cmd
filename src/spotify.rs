@@ -16,6 +16,7 @@ use rspotify::{
     prelude::*,
 };
 use std::future::Future;
+use tokio::sync::RwLockReadGuard;
 
 pub type Client = AuthCodePkceSpotify;
 
@@ -314,6 +315,20 @@ impl ApiError {
             status: Some(429),
             retry_after,
             message: status_message(429, Kind::Query, retry_after),
+        }
+    }
+
+    /// Error al pedir las canciones de una playlist: con el código `status`
+    /// o, si es `None`, sin red.
+    pub fn playlist_items(status: Option<u16>) -> Self {
+        let message = match status {
+            Some(code) => status_message(code, Kind::PlaylistItems, None),
+            None => OFFLINE.into(),
+        };
+        ApiError {
+            status,
+            retry_after: None,
+            message,
         }
     }
 }
@@ -850,15 +865,16 @@ fn uri_window(len: usize, start: usize, max: usize) -> (usize, usize) {
 }
 
 /// Guarda en disco el token que hay en memoria (rspotify no lo hace: la caché
-/// de `token.json` la gestiona [`crate::config::save_token`]).
+/// de `token.json` la gestiona [`crate::config::save_token`]). La escritura
+/// se hace en un hilo aparte, de uno en uno con los demás guardados.
 pub async fn save_session(sp: &Client) -> Result<()> {
-    let token = match sp.token.lock().await {
+    TOKEN_GATE.save(sp).await
+}
+
+async fn token_in_memory(sp: &Client) -> Option<rspotify::Token> {
+    match sp.token.lock().await {
         Ok(token) => token.clone(),
         Err(_) => None,
-    };
-    match token {
-        Some(token) => crate::config::save_token(&sp.config.cache_path, &token),
-        None => Ok(()),
     }
 }
 
@@ -962,7 +978,57 @@ async fn set_token(sp: &Client, token: rspotify::Token) {
 
 /// Próximo reintento permitido tras un fallo al renovar y el aviso que se da
 /// hasta entonces.
-type RetryGate = tokio::sync::Mutex<Option<(Instant, &'static str)>>;
+type RetryState = Option<(Instant, &'static str)>;
+
+/// Turno para renovar el token y para guardarlo en disco.
+struct TokenGate {
+    /// Se mantiene tomado mientras dura una renovación.
+    retry: tokio::sync::Mutex<RetryState>,
+    /// Cada guardado tras una renovación tiene tomada una lectura; quien
+    /// quiere esperar a que acaben todos pide la escritura.
+    saves: tokio::sync::RwLock<()>,
+    /// Turno de escritura en disco: los guardados van de uno en uno.
+    order: tokio::sync::Mutex<()>,
+}
+
+impl TokenGate {
+    const fn new() -> Self {
+        TokenGate {
+            retry: tokio::sync::Mutex::const_new(None),
+            saves: tokio::sync::RwLock::const_new(()),
+            order: tokio::sync::Mutex::const_new(()),
+        }
+    }
+
+    /// Guarda el token que hay en memoria. La escritura (con `fsync`) se hace
+    /// en un hilo aparte para no bloquear el runtime de tokio si el disco va
+    /// lento. Cada guardado lee el token cuando le llega el turno, así que el
+    /// último en escribir guarda el más reciente.
+    async fn save(&self, sp: &Client) -> Result<()> {
+        let _turn = self.order.lock().await;
+        let Some(token) = token_in_memory(sp).await else {
+            return Ok(());
+        };
+        let path = sp.config.cache_path.clone();
+        tokio::task::spawn_blocking(move || crate::config::save_token(&path, &token))
+            .await
+            .map_err(|e| anyhow!("no se pudo guardar la sesión: {e}"))?
+    }
+
+    /// Espera, como mucho `max`, a que no haya ninguna renovación ni ningún
+    /// guardado de una renovación en curso.
+    async fn wait_idle(&self, max: Duration) {
+        let _ = tokio::time::timeout(max, self.idle()).await;
+    }
+
+    async fn idle(&self) {
+        let _renewal = self.retry.lock().await;
+        let _saves = self.saves.write().await;
+    }
+}
+
+/// El de la app: compartido por todas las peticiones.
+static TOKEN_GATE: TokenGate = TokenGate::new();
 
 /// Renueva el token si ha caducado, de uno en uno. Con PKCE cada refresh token
 /// solo sirve una vez, así que varias tareas renovándolo a la vez fallarían.
@@ -970,12 +1036,19 @@ type RetryGate = tokio::sync::Mutex<Option<(Instant, &'static str)>>;
 /// Si la renovación falla, no se reintenta en cada petición: se espera un
 /// rato (según [`RefreshFailure`]).
 pub async fn ensure_token(sp: &Client) -> Result<()> {
-    static RETRY: RetryGate = tokio::sync::Mutex::const_new(None);
-    ensure_token_with(sp, &RETRY).await
+    ensure_token_with(sp, &TOKEN_GATE).await
 }
 
-async fn ensure_token_with(sp: &Client, gate: &RetryGate) -> Result<()> {
-    let mut retry = gate.lock().await;
+/// Espera, como mucho `max`, a que terminen la renovación del token en curso
+/// y su guardado. Se llama antes de salir: cortarlas a medias puede dejar en
+/// `token.json` un refresh token ya gastado (con PKCE solo sirven una vez) y
+/// obligar a iniciar sesión otra vez en el navegador.
+pub async fn wait_for_renewal(max: Duration) {
+    TOKEN_GATE.wait_idle(max).await;
+}
+
+async fn ensure_token_with(sp: &Client, gate: &'static TokenGate) -> Result<()> {
+    let mut retry = gate.retry.lock().await;
     if token_is_valid(sp).await {
         *retry = None;
         return Ok(());
@@ -988,10 +1061,12 @@ async fn ensure_token_with(sp: &Client, gate: &RetryGate) -> Result<()> {
     match refresh_session(sp).await {
         Ok(()) => {
             *retry = None;
-            // Si no se puede guardar en disco (disco lleno, permisos), la app
-            // sigue con el token en memoria; solo habrá que volver a entrar la
-            // próxima vez que se abra.
-            let _ = save_session(sp).await;
+            // El guardado se apunta antes de soltar el turno (así quien espera
+            // a que todo acabe, al salir, también lo espera). Nunca espera:
+            // solo `idle` pide la escritura, y lo hace con el turno tomado.
+            let saving = gate.saves.read().await;
+            drop(retry);
+            save_in_background(sp.clone(), gate, saving);
             Ok(())
         }
         Err(failure) => {
@@ -1000,6 +1075,17 @@ async fn ensure_token_with(sp: &Client, gate: &RetryGate) -> Result<()> {
             anyhow::bail!(reason)
         }
     }
+}
+
+/// Guarda la sesión renovada en segundo plano: el token en memoria ya vale,
+/// así que ni la petición que pidió renovar ni las demás esperan al disco.
+/// Si no se puede guardar (disco lleno, permisos), la app sigue con el token
+/// en memoria; solo habrá que volver a entrar la próxima vez que se abra.
+fn save_in_background(sp: Client, gate: &'static TokenGate, saving: RwLockReadGuard<'static, ()>) {
+    tokio::spawn(async move {
+        let _ = gate.save(&sp).await;
+        drop(saving);
+    });
 }
 
 /// Renueva el token. Si Spotify rechaza el refresh token, puede que otra
@@ -1283,6 +1369,11 @@ mod tests {
     /// Imita accounts.spotify.com: responde a cada petición con la siguiente
     /// respuesta de la lista (la última se repite). Devuelve su URL.
     async fn token_server(responses: Vec<String>) -> (String, Requests) {
+        slow_token_server(responses, Duration::ZERO).await
+    }
+
+    /// Como [`token_server`], pero tarda `delay` en responder.
+    async fn slow_token_server(responses: Vec<String>, delay: Duration) -> (String, Requests) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let requests = Requests::default();
@@ -1296,6 +1387,7 @@ mod tests {
                     seen.len()
                 };
                 let response = &responses[(n - 1).min(responses.len() - 1)];
+                tokio::time::sleep(delay).await;
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             }
@@ -1347,11 +1439,11 @@ mod tests {
         let down = http_response("503 Service Unavailable", "", "");
         let (url, requests) = token_server(vec![down]).await;
         let (sp, dir) = expired_session("refresh_503", &url).await;
-        let gate = RetryGate::const_new(None);
+        let gate = test_gate();
 
-        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        let err = ensure_token_with(&sp, gate).await.unwrap_err().to_string();
         assert_eq!(err, REFRESH_TROUBLE);
-        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        let err = ensure_token_with(&sp, gate).await.unwrap_err().to_string();
         assert_eq!(err, REFRESH_TROUBLE);
         assert_eq!(
             requests.lock().unwrap().len(),
@@ -1367,11 +1459,11 @@ mod tests {
         let busy = http_response("429 Too Many Requests", "retry-after: 60\r\n", "");
         let (url, _requests) = token_server(vec![busy]).await;
         let (sp, dir) = expired_session("refresh_429", &url).await;
-        let gate = RetryGate::const_new(None);
+        let gate = test_gate();
 
-        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        let err = ensure_token_with(&sp, gate).await.unwrap_err().to_string();
         assert!(!err.contains("--logout"));
-        let (at, _) = gate.lock().await.unwrap();
+        let (at, _) = gate.retry.lock().await.unwrap();
         assert!(at > Instant::now() + Duration::from_secs(50));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1385,9 +1477,9 @@ mod tests {
         // En disco está el mismo refresh token que en memoria.
         crate::config::save_token(&sp.config.cache_path, &session_token("viejo", "r0", false))
             .unwrap();
-        let gate = RetryGate::const_new(None);
+        let gate = test_gate();
 
-        let err = ensure_token_with(&sp, &gate).await.unwrap_err().to_string();
+        let err = ensure_token_with(&sp, gate).await.unwrap_err().to_string();
         assert_eq!(err, SESSION_EXPIRED);
         assert_eq!(requests.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1404,11 +1496,12 @@ mod tests {
             &session_token("de-disco", "r1", true),
         )
         .unwrap();
-        let gate = RetryGate::const_new(None);
+        let gate = test_gate();
 
-        ensure_token_with(&sp, &gate).await.unwrap();
+        ensure_token_with(&sp, gate).await.unwrap();
         assert_eq!(access_token(&sp).await.as_deref(), Some("de-disco"));
         assert_eq!(requests.lock().unwrap().len(), 1);
+        gate.wait_idle(Duration::from_secs(5)).await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1423,16 +1516,102 @@ mod tests {
             &session_token("de-disco", "r1", false),
         )
         .unwrap();
-        let gate = RetryGate::const_new(None);
+        let gate = test_gate();
 
-        ensure_token_with(&sp, &gate).await.unwrap();
+        ensure_token_with(&sp, gate).await.unwrap();
         assert_eq!(access_token(&sp).await.as_deref(), Some("renovado"));
+        gate.wait_idle(Duration::from_secs(5)).await;
         let requests = requests.lock().unwrap().clone();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("refresh_token=r0"));
         assert!(requests[1].contains("refresh_token=r1"));
         let saved = crate::config::load_token(&sp.config.cache_path, &Default::default()).unwrap();
         assert_eq!(saved.access_token, "renovado");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Puerta propia de cada prueba (como la de la app, vive hasta el final).
+    fn test_gate() -> &'static TokenGate {
+        Box::leak(Box::new(TokenGate::new()))
+    }
+
+    /// Espera (con tope) a que el servidor de prueba reciba `n` peticiones.
+    async fn wait_requests(requests: &Requests, n: usize) {
+        for _ in 0..200 {
+            if requests.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("el servidor de tokens no recibió la petición");
+    }
+
+    fn saved_access_token(sp: &Client) -> Option<String> {
+        crate::config::load_token(&sp.config.cache_path, &Default::default())
+            .map(|t| t.access_token)
+    }
+
+    /// Al salir con una renovación en curso, se espera a que termine y quede
+    /// guardada: cortarla dejaría en disco un refresh token ya gastado.
+    #[tokio::test]
+    async fn exit_waits_for_the_renewal_in_progress_and_its_save() {
+        let delay = Duration::from_millis(300);
+        let (url, requests) = slow_token_server(vec![renewed()], delay).await;
+        let (sp, dir) = expired_session("exit_wait", &url).await;
+        let gate = test_gate();
+        let renewal = {
+            let sp = sp.clone();
+            tokio::spawn(async move { ensure_token_with(&sp, gate).await })
+        };
+        wait_requests(&requests, 1).await;
+
+        gate.wait_idle(Duration::from_secs(5)).await;
+        assert_eq!(saved_access_token(&sp).as_deref(), Some("renovado"));
+        assert!(renewal.await.unwrap().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Si el guardado no termina (disco colgado), la salida no espera más del
+    /// tope.
+    #[tokio::test]
+    async fn exit_wait_is_bounded() {
+        let gate = test_gate();
+        gate.wait_idle(Duration::from_secs(5)).await;
+
+        let _hung_save = gate.saves.read().await;
+        let start = Instant::now();
+        gate.wait_idle(Duration::from_millis(100)).await;
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(100));
+        assert!(waited < Duration::from_secs(3));
+    }
+
+    /// Un disco lento al guardar no frena ninguna petición, tampoco la que
+    /// pidió renovar: el token en memoria ya vale. La salida, en cambio, sí
+    /// espera (con tope) a que llegue al disco.
+    #[tokio::test]
+    async fn slow_save_does_not_hold_requests() {
+        let (url, _requests) = token_server(vec![renewed()]).await;
+        let (sp, dir) = expired_session("slow_save", &url).await;
+        let gate = test_gate();
+        // Simula un disco lento: el turno de escritura está ocupado.
+        let slow_disk = gate.order.lock().await;
+
+        let quick = Duration::from_secs(2);
+        let renewal = tokio::time::timeout(quick, ensure_token_with(&sp, gate)).await;
+        assert!(renewal.expect("la renovación esperó al disco").is_ok());
+        let other = tokio::time::timeout(quick, ensure_token_with(&sp, gate)).await;
+        assert!(other.expect("otra petición esperó al disco").is_ok());
+        assert_eq!(access_token(&sp).await.as_deref(), Some("renovado"));
+        assert_eq!(saved_access_token(&sp), None, "aún no se ha escrito");
+
+        let start = Instant::now();
+        gate.wait_idle(Duration::from_millis(300)).await;
+        assert!(start.elapsed() >= Duration::from_millis(300));
+
+        drop(slow_disk);
+        gate.wait_idle(Duration::from_secs(5)).await;
+        assert_eq!(saved_access_token(&sp).as_deref(), Some("renovado"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

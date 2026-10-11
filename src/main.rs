@@ -43,10 +43,10 @@ use anyhow::{Context, Result};
 use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
-use ratatui_image::picker::Picker;
-use tokio::sync::mpsc::unbounded_channel;
+use ratatui_image::{picker::Picker, thread::ResizeRequest};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::app::{App, Msg};
+use crate::app::{App, CrashOrigin, Msg};
 
 const HELP: &str = "\
 spotify_cmd — cliente de Spotify para la terminal
@@ -142,9 +142,16 @@ async fn try_main() -> Result<()> {
 
     let mut tui = tui;
     let result = run(&mut tui, spotify, picker, cfg.poll_secs).await;
+    // Una renovación del token en curso (y su guardado) termina antes de
+    // destruir el runtime: cortada a medias, dejaría en disco un refresh
+    // token ya gastado y habría que volver a entrar en el navegador.
+    spotify::wait_for_renewal(RENEWAL_GRACE).await;
     close_terminal(tui);
     result
 }
+
+/// Tiempo máximo que se espera, al salir, a una renovación del token en curso.
+const RENEWAL_GRACE: Duration = Duration::from_secs(5);
 
 /// Devuelve el cursor y suelta la terminal. Si la terminal ya no existe (se
 /// cerró la ventana), se evita el `Drop` de ratatui, que intentaría escribir
@@ -212,6 +219,9 @@ async fn run(
             }
         }
 
+        // Los redimensionados de la carátula solo se piden al dibujar.
+        dispatch_resizes(&mut resize_rx, &app, &msg_tx);
+
         // 2. Esperar lo primero que ocurra.
         tokio::select! {
             event = events.next() => match event {
@@ -232,13 +242,6 @@ async fn run(
             Some(msg) = app.rx.recv() => {
                 protected(&mut app, |a| a.on_msg(msg));
             }
-            Some(request) = resize_rx.recv() => {
-                // Redimensionar y codificar la imagen es costoso: se hace fuera
-                // del hilo de la interfaz.
-                app::spawn_blocking_guarded(msg_tx.clone(), move || {
-                    Msg::Resized(request.resize_encode())
-                });
-            }
             _ = tick.tick() => {
                 protected(&mut app, App::on_tick);
             }
@@ -246,6 +249,27 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Lanza los redimensionados de la carátula pedidos al dibujar. Redimensionar
+/// y codificar la imagen es costoso: se hace fuera del hilo de la interfaz.
+///
+/// Se llama justo después de dibujar, así que la generación de la carátula es
+/// la de cada petición: si la carátula cambia mientras tanto, la respuesta (o
+/// el *panic*) de una petición obsoleta se reconoce y se ignora.
+fn dispatch_resizes(
+    requests: &mut UnboundedReceiver<ResizeRequest>,
+    app: &App,
+    tx: &UnboundedSender<Msg>,
+) {
+    let generation = app.cover_generation();
+    while let Ok(request) = requests.try_recv() {
+        let origin = CrashOrigin::Resize(generation);
+        app::spawn_blocking_guarded(tx.clone(), origin, move || Msg::Resized {
+            generation,
+            result: request.resize_encode(),
+        });
+    }
 }
 
 /// Termina limpiamente si el sistema pide cerrar (SIGTERM, SIGHUP, SIGINT).
@@ -292,5 +316,51 @@ mod tests {
         protected(&mut app, |a| a.should_quit = true);
         assert!(app.should_quit);
         assert!(app.status.is_none());
+    }
+
+    /// Dibuja la carátula grande y lanza los redimensionados que pida.
+    async fn draw_and_resize(
+        app: &mut App,
+        requests: &mut UnboundedReceiver<ResizeRequest>,
+    ) -> Msg {
+        let backend = ratatui::backend::TestBackend::new(60, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let (tx, mut rx) = unbounded_channel();
+        dispatch_resizes(requests, app, &tx);
+        rx.recv().await.expect("se pidió un redimensionado")
+    }
+
+    fn cover() -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(16, 16))
+    }
+
+    /// Los redimensionados pedidos al dibujar llevan la generación de la
+    /// carátula: la respuesta de la actual se aplica.
+    #[tokio::test]
+    async fn resizes_carry_the_cover_generation() {
+        let (mut app, mut requests) = app::tests::test_app();
+        app.big_cover = true;
+        app.set_cover_image(cover());
+        let msg = draw_and_resize(&mut app, &mut requests).await;
+        let current = app.cover_generation();
+        assert!(matches!(msg, Msg::Resized { generation, .. } if generation == current));
+        app.on_msg(msg);
+        assert!(app.cover.protocol_type().is_some());
+    }
+
+    /// Si la carátula cambia mientras se redimensiona la anterior, la
+    /// respuesta vieja se ignora y no sustituye a la nueva.
+    #[tokio::test]
+    async fn resize_of_a_replaced_cover_is_ignored() {
+        let (mut app, mut requests) = app::tests::test_app();
+        app.big_cover = true;
+        app.set_cover_image(cover());
+        let old = draw_and_resize(&mut app, &mut requests).await;
+        app.set_cover_image(cover());
+        let fresh = app.cover_generation();
+        app.on_msg(old);
+        assert_eq!(app.cover_generation(), fresh);
+        assert!(app.cover.protocol_type().is_some(), "la nueva sigue lista");
     }
 }

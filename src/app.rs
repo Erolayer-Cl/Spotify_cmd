@@ -66,29 +66,60 @@ pub enum Msg {
         url: String,
         result: Result<DynamicImage>,
     },
-    Resized(std::result::Result<ResizeResponse, Errors>),
+    /// Redimensionado de la carátula pedido para la generación `generation`
+    /// (ver [`App::cover_generation`]).
+    Resized {
+        generation: u64,
+        result: std::result::Result<ResizeResponse, Errors>,
+    },
     /// Una tarea en segundo plano falló de forma inesperada (*panic*). La
-    /// aplicación lo muestra y sigue funcionando.
-    Crashed(String),
+    /// aplicación lo muestra y sigue funcionando; `origin` dice qué tarea
+    /// era, para deshacer solo lo suyo.
+    Crashed {
+        origin: CrashOrigin,
+        reason: String,
+    },
     /// La sesión no se pudo renovar (token revocado o sin red).
     SessionProblem(String),
 }
 
+/// Qué tarea sufrió un *panic*: decide qué se da por perdido. Un fallo solo
+/// deshace el trabajo de su propia tarea, no el de las demás.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashOrigin {
+    /// Cualquier otra tarea (consultas, acciones, descargas) o la propia
+    /// interfaz (al dibujar o al procesar un evento).
+    Other,
+    /// La carga de la lista (o búsqueda) con este identificador de petición.
+    List(u64),
+    /// El redimensionado de la carátula de esta generación.
+    Resize(u64),
+}
+
 /// Lanza una tarea que siempre responde con un mensaje: si la tarea sufre un
-/// *panic*, se envía [`Msg::Crashed`] en lugar de perder la respuesta. Solo
-/// una tarea cancelada (con el `AbortHandle` devuelto) no responde.
-pub fn spawn_guarded<Fut>(tx: UnboundedSender<Msg>, task: Fut) -> AbortHandle
+/// *panic*, se envía [`Msg::Crashed`] (con su `origin`) en lugar de perder la
+/// respuesta. Solo una tarea cancelada (con el `AbortHandle` devuelto) no
+/// responde.
+pub fn spawn_guarded<Fut>(tx: UnboundedSender<Msg>, origin: CrashOrigin, task: Fut) -> AbortHandle
 where
     Fut: Future<Output = Msg> + Send + 'static,
 {
     tokio::spawn(async move {
         let msg = match AssertUnwindSafe(task).catch_unwind().await {
             Ok(msg) => msg,
-            Err(payload) => Msg::Crashed(terminal::panic_message(payload)),
+            Err(payload) => crashed(origin, payload),
         };
         let _ = tx.send(msg);
     })
     .abort_handle()
+}
+
+/// Mensaje de un *panic* en una tarea de origen `origin`.
+fn crashed(origin: CrashOrigin, payload: Box<dyn std::any::Any + Send>) -> Msg {
+    Msg::Crashed {
+        origin,
+        reason: terminal::panic_message(payload),
+    }
 }
 
 /// Renueva la sesión si hace falta, en su propia tarea: si se cancela la
@@ -97,30 +128,30 @@ where
 /// cada refresh token solo sirve una vez.
 ///
 /// Si no se pudo renovar, se avisa y la petición sigue (fallará con su propio
-/// mensaje, sin bloquear la interfaz). Devuelve [`Msg::Crashed`] si la
-/// renovación sufrió un *panic*.
-async fn renew_session(sp: Client, tx: &UnboundedSender<Msg>) -> Option<Msg> {
+/// mensaje, sin bloquear la interfaz). Devuelve el *panic* de la renovación,
+/// si lo hubo: la petición que la esperaba lo comunica como suyo.
+async fn renew_session(
+    sp: Client,
+    tx: &UnboundedSender<Msg>,
+) -> Option<Box<dyn std::any::Any + Send>> {
     match tokio::spawn(async move { spotify::ensure_token(&sp).await }).await {
         Ok(Ok(())) => None,
         Ok(Err(e)) => {
             let _ = tx.send(Msg::SessionProblem(e.to_string()));
             None
         }
-        Err(e) => e
-            .try_into_panic()
-            .ok()
-            .map(|payload| Msg::Crashed(terminal::panic_message(payload))),
+        Err(e) => e.try_into_panic().ok(),
     }
 }
 
 /// Igual que [`spawn_guarded`] pero para trabajo pesado de CPU (en otro hilo).
-pub fn spawn_blocking_guarded<F>(tx: UnboundedSender<Msg>, work: F)
+pub fn spawn_blocking_guarded<F>(tx: UnboundedSender<Msg>, origin: CrashOrigin, work: F)
 where
     F: FnOnce() -> Msg + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
         let msg = std::panic::catch_unwind(AssertUnwindSafe(work))
-            .unwrap_or_else(|payload| Msg::Crashed(terminal::panic_message(payload)));
+            .unwrap_or_else(|payload| crashed(origin, payload));
         let _ = tx.send(msg);
     });
 }
@@ -259,8 +290,12 @@ pub struct App {
     cover_url: Option<String>,
     /// Carátula descargada: permite volver a prepararla si falla su dibujo.
     cover_image: Option<DynamicImage>,
-    /// Veces que se ha vuelto a preparar la carátula actual.
+    /// Veces seguidas que se ha vuelto a preparar la carátula actual (vuelve
+    /// a 0 cuando un redimensionado sale bien).
     cover_rebuilds: u8,
+    /// Cambia cada vez que se sustituye (o se quita) la carátula preparada:
+    /// identifica los redimensionados ya obsoletos.
+    cover_generation: u64,
     /// Tras fallar la descarga de la carátula, cuándo se puede reintentar.
     cover_retry_at: Option<Instant>,
 
@@ -345,6 +380,7 @@ impl App {
             cover_url: None,
             cover_image: None,
             cover_rebuilds: 0,
+            cover_generation: 0,
             cover_retry_at: None,
             status: None,
             pending_seek: Debounced::default(),
@@ -376,11 +412,21 @@ impl App {
         F: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Msg> + Send + 'static,
     {
+        self.spawn_as(CrashOrigin::Other, f)
+    }
+
+    /// Como [`Self::spawn`]; un *panic* (también el de la renovación de la
+    /// sesión) se comunica como de origen `origin`.
+    fn spawn_as<F, Fut>(&self, origin: CrashOrigin, f: F) -> AbortHandle
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Msg> + Send + 'static,
+    {
         let sp = self.spotify.clone();
         let tx = self.tx.clone();
-        spawn_guarded(self.tx.clone(), async move {
-            if let Some(crashed) = renew_session(sp.clone(), &tx).await {
-                return crashed;
+        spawn_guarded(self.tx.clone(), origin, async move {
+            if let Some(payload) = renew_session(sp.clone(), &tx).await {
+                return crashed(origin, payload);
             }
             f(sp).await
         })
@@ -478,13 +524,24 @@ impl App {
     }
 
     /// Lanza la carga de la petición en curso y guarda su tarea para poder
-    /// cancelarla.
+    /// cancelarla. Si sufre un *panic*, el fallo se atribuye a esta petición.
     fn spawn_list<F, Fut>(&mut self, f: F)
     where
         F: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Msg> + Send + 'static,
     {
-        self.list_task = Some(self.spawn(f));
+        let origin = CrashOrigin::List(self.request_id);
+        self.list_task = Some(self.spawn_as(origin, f));
+    }
+
+    /// Si `request` es la petición de lista en curso. Si lo es, su respuesta
+    /// ya llegó: no queda tarea que cancelar.
+    fn is_current_list(&mut self, request: u64) -> bool {
+        if request != self.request_id {
+            return false;
+        }
+        self.list_task = None;
+        true
     }
 
     fn do_action(&mut self, action: Action) {
@@ -916,7 +973,7 @@ impl App {
                 }
             }
             Msg::Tracks { request, result } => {
-                if request != self.request_id {
+                if !self.is_current_list(request) {
                     return;
                 }
                 let pending = self.pending_list.take().unwrap_or(PendingList {
@@ -932,7 +989,7 @@ impl App {
                 kind,
                 result,
             } => {
-                if request != self.request_id {
+                if !self.is_current_list(request) {
                     return;
                 }
                 self.main = match result {
@@ -1008,17 +1065,8 @@ impl App {
                     }
                 }
             }
-            Msg::Resized(result) => match result {
-                Ok(resp) => {
-                    self.cover.update_resized_protocol(resp);
-                }
-                Err(e) => {
-                    if !self.rebuild_cover() {
-                        self.set_status(format!("Error al dibujar la carátula: {e}"), true);
-                    }
-                }
-            },
-            Msg::Crashed(reason) => self.report_crash(&reason),
+            Msg::Resized { generation, result } => self.on_resized(generation, result),
+            Msg::Crashed { origin, reason } => self.recover_from_crash(origin, &reason),
             Msg::SessionProblem(reason) => {
                 self.session_problem = Some(reason.clone());
                 self.set_status(reason, true);
@@ -1050,34 +1098,88 @@ impl App {
         }
     }
 
-    /// Registra un fallo inesperado (en una tarea, al dibujar o al procesar
+    /// Registra un fallo inesperado de la interfaz (al dibujar o al procesar
     /// un evento) y deja el estado coherente para seguir funcionando.
     pub fn report_crash(&mut self, reason: &str) {
+        self.recover_from_crash(CrashOrigin::Other, reason);
+    }
+
+    /// Registra un fallo inesperado de origen `origin`. Solo se deshace lo
+    /// que ese fallo dejó a medias: un *panic* ajeno no cancela la carga de
+    /// una lista ni gasta el reintento de la carátula.
+    fn recover_from_crash(&mut self, origin: CrashOrigin, reason: &str) {
         // El fallo pudo ser de la consulta del estado o de la carga de las
         // playlists: se permite lanzar otra. Si la anterior sigue viva, su
         // respuesta no pisa a una más reciente (ver `on_playback`).
         self.playback_inflight = false;
         self.playlists_inflight = false;
-        if matches!(self.main, MainContent::Loading(_)) {
-            // La carga se da por fallida de forma coherente: si su respuesta
-            // llega más tarde, se descarta en vez de mostrarse sin su título
-            // ni su origen (y reproducirse como una lista suelta).
-            self.abandon_request();
-            self.main =
-                MainContent::Message(format!("No se pudo completar la operación: {reason}"));
+        if self.list_lost(origin) {
+            self.give_up_list(reason);
         }
         if matches!(self.popup, Popup::Devices { devices: None, .. }) {
             self.popup = Popup::None;
         }
-        // Si falló el redimensionado de la carátula, la imagen se perdió con
-        // él: se vuelve a preparar a partir de la descargada.
-        if self.has_cover() && self.cover.protocol_type().is_none() {
+        // La imagen salió del protocolo para redimensionarse y se perdió con
+        // el fallo: se vuelve a preparar a partir de la descargada.
+        if self.resize_lost(origin) {
             self.rebuild_cover();
         }
         self.set_status(
             format!("Error interno (la aplicación sigue funcionando): {reason}"),
             true,
         );
+    }
+
+    /// La carga de lista en curso ya no puede terminar: el fallo fue de su
+    /// propia tarea, o su respuesta ya había llegado y falló al procesarla.
+    fn list_lost(&self, origin: CrashOrigin) -> bool {
+        match origin {
+            CrashOrigin::List(request) => request == self.request_id,
+            _ => self.list_task.is_none() && matches!(self.main, MainContent::Loading(_)),
+        }
+    }
+
+    /// Da por fallida la carga en curso de forma coherente: si su respuesta
+    /// llega más tarde, se descarta en vez de mostrarse sin su título ni su
+    /// origen (y reproducirse como una lista suelta). Una recarga deja ver la
+    /// lista que había.
+    fn give_up_list(&mut self, reason: &str) {
+        self.abandon_request();
+        if matches!(self.main, MainContent::Loading(_)) {
+            self.main =
+                MainContent::Message(format!("No se pudo completar la operación: {reason}"));
+        }
+    }
+
+    /// El fallo fue del redimensionado de la carátula actual, que se perdió.
+    fn resize_lost(&self, origin: CrashOrigin) -> bool {
+        origin == CrashOrigin::Resize(self.cover_generation) && self.resizing_cover()
+    }
+
+    /// La carátula actual está fuera del protocolo, redimensionándose.
+    fn resizing_cover(&self) -> bool {
+        self.has_cover() && self.cover.protocol_type().is_none()
+    }
+
+    /// Respuesta del redimensionado pedido para la generación `generation`.
+    /// La de una carátula ya sustituida (o ya preparada) no cuenta: aplicar
+    /// su error cancelaría el redimensionado sano de la actual.
+    fn on_resized(&mut self, generation: u64, result: std::result::Result<ResizeResponse, Errors>) {
+        if generation != self.cover_generation || !self.resizing_cover() {
+            return;
+        }
+        match result {
+            Ok(resp) => {
+                if self.cover.update_resized_protocol(resp) {
+                    self.cover_rebuilds = 0;
+                }
+            }
+            Err(e) => {
+                if !self.rebuild_cover() {
+                    self.set_status(format!("Error al dibujar la carátula: {e}"), true);
+                }
+            }
+        }
     }
 
     pub fn show_error(&mut self, text: String) {
@@ -1115,7 +1217,7 @@ impl App {
                 // Mientras se descarga se sigue viendo la carátula anterior.
                 Some(url) => {
                     let http = self.http.clone();
-                    spawn_guarded(self.tx.clone(), async move {
+                    spawn_guarded(self.tx.clone(), CrashOrigin::Other, async move {
                         let result = spotify::download_image(&http, &url).await;
                         Msg::Cover { url, result }
                     });
@@ -1140,33 +1242,45 @@ impl App {
     /// Muestra `img` como carátula.
     pub fn set_cover_image(&mut self, img: DynamicImage) {
         self.cover_rebuilds = 0;
-        let protocol = self.picker.new_resize_protocol(img.clone());
-        self.cover.replace_protocol(protocol);
+        self.prepare_cover(img.clone());
         self.cover_image = Some(img);
+    }
+
+    /// Generación de la carátula preparada: los redimensionados que se pidan
+    /// ahora la llevan en su respuesta ([`Msg::Resized`]).
+    pub fn cover_generation(&self) -> u64 {
+        self.cover_generation
+    }
+
+    /// Prepara `img` para dibujarla; los redimensionados pendientes de la
+    /// anterior quedan obsoletos.
+    fn prepare_cover(&mut self, img: DynamicImage) {
+        let protocol = self.picker.new_resize_protocol(img);
+        self.cover.replace_protocol(protocol);
+        self.cover_generation = self.cover_generation.wrapping_add(1);
     }
 
     /// Quita la carátula: en su lugar se ve el logo.
     fn clear_cover(&mut self) {
         self.cover_image = None;
         self.cover.empty_protocol();
+        self.cover_generation = self.cover_generation.wrapping_add(1);
     }
 
     /// Tras un fallo al redimensionar, la carátula se vuelve a preparar una
-    /// sola vez; si vuelve a fallar se quita (sale el logo). Devuelve si se
-    /// pudo volver a preparar.
+    /// sola vez; si vuelve a fallar sin un éxito entre medias, se quita (sale
+    /// el logo). Devuelve si se pudo volver a preparar.
     fn rebuild_cover(&mut self) -> bool {
-        match &self.cover_image {
-            Some(img) if self.cover_rebuilds == 0 => {
-                self.cover_rebuilds += 1;
-                let protocol = self.picker.new_resize_protocol(img.clone());
-                self.cover.replace_protocol(protocol);
-                true
-            }
+        let img = match &self.cover_image {
+            Some(img) if self.cover_rebuilds == 0 => img.clone(),
             _ => {
                 self.clear_cover();
-                false
+                return false;
             }
-        }
+        };
+        self.cover_rebuilds += 1;
+        self.prepare_cover(img);
+        true
     }
 
     /// Programa la recarga de la lista visible cuando Spotify ya refleje el
@@ -1418,18 +1532,26 @@ impl App {
     }
 }
 
-/// Lo que se muestra cuando no se pudo cargar una lista. Si era una playlist o
-/// un álbum, se conserva para poder reproducirlo entero con Enter.
+/// Lo que se muestra cuando no se pudo cargar una lista. Si Spotify no deja
+/// ver sus canciones (403, una playlist ajena), se conserva para poder
+/// reproducirla entera con Enter; con cualquier otro error (sin red, 5xx...)
+/// esa acción también fallaría, así que solo se explica el error.
 fn load_error(title: String, source: TrackSource, err: &anyhow::Error) -> MainContent {
     let message = format!("No se pudo cargar «{title}»: {err}");
     match source {
-        TrackSource::Context(context) => MainContent::Unlisted {
+        TrackSource::Context(context) if is_forbidden(err) => MainContent::Unlisted {
             message: format!("{message}\n\nPulsa Enter para reproducir todas sus canciones."),
             title,
             context,
         },
-        TrackSource::Uris => MainContent::Message(message),
+        _ => MainContent::Message(message),
     }
+}
+
+/// Spotify denegó el acceso (403).
+fn is_forbidden(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiError>()
+        .is_some_and(|api| api.status == Some(403))
 }
 
 /// Desde dónde reproducir la canción `index` de un contexto; `None` si no se
@@ -1499,6 +1621,19 @@ pub mod tests {
     pub fn test_app() -> (App, UnboundedReceiver<ResizeRequest>) {
         let (tx, rx) = unbounded_channel();
         (App::new(Client::default(), Picker::halfblocks(), tx, 3), rx)
+    }
+
+    /// *Panic* simulado de una tarea de origen `origin`.
+    pub fn crash(origin: CrashOrigin, reason: &str) -> Msg {
+        Msg::Crashed {
+            origin,
+            reason: reason.into(),
+        }
+    }
+
+    /// Error de la API al pedir las canciones de una playlist.
+    fn api_error(status: Option<u16>) -> anyhow::Error {
+        anyhow::Error::new(ApiError::playlist_items(status))
     }
 
     fn key(code: KeyCode) -> Event {
@@ -1611,9 +1746,7 @@ pub mod tests {
         app.on_event(key(KeyCode::Enter));
         app.on_msg(Msg::Tracks {
             request: app.request_id,
-            result: Err(anyhow::anyhow!(
-                "Spotify solo deja ver las canciones de tus playlists"
-            )),
+            result: Err(api_error(Some(403))),
         });
         match &app.main {
             MainContent::Unlisted {
@@ -1631,6 +1764,54 @@ pub mod tests {
         app.on_event(key(KeyCode::Enter));
         let status = app.visible_status().map(|s| s.text.as_str());
         assert_eq!(status, Some("Reproduciendo «Today's Top Hits»"));
+    }
+
+    /// Sin red, la playlist no se ofrece para reproducirla entera (también
+    /// fallaría): solo se explica el error.
+    #[tokio::test]
+    async fn offline_playlist_only_shows_the_error() {
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![playlist("Rock")];
+        app.open_library(LibraryItem::Playlist(0));
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Err(api_error(None)),
+        });
+        match &app.main {
+            MainContent::Message(m) => {
+                assert!(m.contains("Rock") && m.contains("sin conexión"));
+                assert!(!m.contains("Enter"));
+            }
+            other => panic!("se esperaba solo el error, no {other:?}"),
+        }
+    }
+
+    /// Solo un 403 de una playlist o un álbum se puede reproducir entero; el
+    /// resto de errores (sin red, 429, 5xx, otros) solo se explican.
+    #[test]
+    fn only_forbidden_contexts_are_offered_to_play() {
+        let context = || {
+            let id = PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string()).unwrap();
+            TrackSource::Context(PlayContextId::Playlist(id))
+        };
+        let shown = |source, err| load_error("Lista".into(), source, &err);
+        assert!(matches!(
+            shown(context(), api_error(Some(403))),
+            MainContent::Unlisted { .. }
+        ));
+        for err in [
+            api_error(None),
+            api_error(Some(429)),
+            api_error(Some(500)),
+            api_error(Some(404)),
+            anyhow::anyhow!("error inesperado"),
+        ] {
+            assert!(matches!(shown(context(), err), MainContent::Message(_)));
+        }
+        assert!(matches!(
+            shown(TrackSource::Uris, api_error(Some(403))),
+            MainContent::Message(_)
+        ));
     }
 
     /// Las listas sin contexto (me gusta, recientes...) no tienen nada que
@@ -1706,7 +1887,7 @@ pub mod tests {
 
     /// Deja terminar las tareas en segundo plano y recoge sus respuestas. Con
     /// el cliente de prueba (sin sesión) fallan enseguida, sin usar la red.
-    async fn responses(app: &mut App) -> Vec<Msg> {
+    pub async fn responses(app: &mut App) -> Vec<Msg> {
         let mut msgs = Vec::new();
         let wait = Duration::from_millis(300);
         while let Ok(Some(msg)) = tokio::time::timeout(wait, app.rx.recv()).await {
@@ -1764,15 +1945,47 @@ pub mod tests {
         );
     }
 
-    /// Un fallo ajeno mientras carga una playlist la da por fallida: si su
-    /// respuesta llega luego, no aparece como una lista suelta «Canciones».
+    /// Un fallo ajeno (la carátula, otra petición, el dibujo) mientras carga
+    /// una playlist no la cancela: su respuesta se muestra con su título.
     #[tokio::test]
-    async fn crash_while_loading_discards_the_late_list() {
+    async fn unrelated_crash_keeps_loading_the_list() {
         let (mut app, _rx) = test_app();
         app.playlists = vec![playlist("Rock")];
         app.open_library(LibraryItem::Playlist(0));
         let request = app.request_id;
-        app.on_msg(Msg::Crashed("fallo al redimensionar la carátula".into()));
+        let generation = app.cover_generation();
+        app.on_msg(crash(
+            CrashOrigin::Resize(generation),
+            "fallo al redimensionar",
+        ));
+        app.on_msg(crash(CrashOrigin::Other, "fallo en otra petición"));
+        app.on_msg(crash(
+            CrashOrigin::List(request - 1),
+            "fallo de una lista vieja",
+        ));
+        app.report_crash("al dibujar: fallo simulado");
+        assert!(matches!(app.main, MainContent::Loading(_)));
+        assert!(status(&app).is_some_and(|s| s.contains("Error interno")));
+
+        deliver(&mut app, vec![song("Bohemian Rhapsody")]);
+        assert!(matches!(
+            &app.main,
+            MainContent::Tracks { title, source: TrackSource::Context(_), .. } if title == "Rock"
+        ));
+    }
+
+    /// Un *panic* de la propia carga da la lista por fallida: si su respuesta
+    /// llega luego, no aparece como una lista suelta «Canciones».
+    #[tokio::test]
+    async fn crash_of_the_list_task_discards_its_late_answer() {
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![playlist("Rock")];
+        app.open_library(LibraryItem::Playlist(0));
+        let request = app.request_id;
+        app.on_msg(crash(
+            CrashOrigin::List(request),
+            "la API devolvió algo imposible",
+        ));
         assert!(matches!(app.main, MainContent::Message(_)));
         app.on_msg(Msg::Tracks {
             request,
@@ -1843,7 +2056,7 @@ pub mod tests {
         // La vieja llega primero: se aplica, pero sigue esperando a la nueva.
         assert!(app.poll_playback());
         let old = app.poll_seq;
-        app.on_msg(Msg::Crashed("boom".into()));
+        app.on_msg(crash(CrashOrigin::Other, "boom"));
         assert!(app.poll_playback());
         let new = app.poll_seq;
         app.on_msg(Msg::Playback {
@@ -1861,7 +2074,7 @@ pub mod tests {
         // La nueva llega primero: la vieja se ignora.
         assert!(app.poll_playback());
         let old = app.poll_seq;
-        app.on_msg(Msg::Crashed("boom".into()));
+        app.on_msg(crash(CrashOrigin::Other, "boom"));
         assert!(app.poll_playback());
         app.on_msg(Msg::Playback {
             seq: app.poll_seq,
@@ -2184,34 +2397,130 @@ pub mod tests {
     /// vuelve a preparar una vez; si falla otra vez, se muestra el logo.
     #[tokio::test]
     async fn failed_cover_resize_is_rebuilt_once() {
-        use ratatui::layout::Size;
-        use ratatui_image::{Resize, ResizeEncodeRender};
-
-        let (mut app, mut resize_rx) = test_app();
-        // Como al dibujar: la imagen sale del protocolo para redimensionarse.
-        let start_resize = |app: &mut App| {
-            app.cover.resize_encode(&Resize::Fit(None), Size::new(8, 4));
-            assert!(app.cover.protocol_type().is_none());
-        };
-        let encode_error = || Msg::Resized(Err(Errors::Sixel("fallo simulado".into())));
-
+        let (mut app, mut rx) = test_app();
         app.set_cover_image(tiny_image());
-        start_resize(&mut app);
-        assert!(resize_rx.try_recv().is_ok());
+        let _ = start_cover_resize(&mut app, &mut rx);
         assert!(app.has_cover(), "redimensionando no es «sin carátula»");
-        app.on_msg(encode_error());
+        app.on_msg(encode_error(&app));
         assert!(app.cover.protocol_type().is_some(), "se vuelve a preparar");
         assert_eq!(status(&app), None);
 
-        start_resize(&mut app);
-        app.on_msg(encode_error());
+        let _ = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(encode_error(&app));
         assert!(!app.has_cover(), "al segundo fallo, el logo");
         assert!(status(&app).is_some_and(|s| s.contains("carátula")));
 
         app.set_cover_image(tiny_image());
-        start_resize(&mut app);
-        app.on_msg(Msg::Crashed("panic al codificar".into()));
+        let _ = start_cover_resize(&mut app, &mut rx);
+        let origin = CrashOrigin::Resize(app.cover_generation());
+        app.on_msg(crash(origin, "panic al codificar"));
         assert!(app.cover.protocol_type().is_some());
+    }
+
+    /// Error de redimensionado de la carátula de la generación actual.
+    fn encode_error(app: &App) -> Msg {
+        resize_error(app.cover_generation())
+    }
+
+    fn resize_error(generation: u64) -> Msg {
+        Msg::Resized {
+            generation,
+            result: Err(Errors::Sixel("fallo simulado".into())),
+        }
+    }
+
+    /// Como al dibujar: la imagen sale del protocolo para redimensionarse.
+    /// Devuelve la petición, para poder completarla.
+    fn start_cover_resize(
+        app: &mut App,
+        rx: &mut UnboundedReceiver<ResizeRequest>,
+    ) -> ResizeRequest {
+        use ratatui::layout::Size;
+        use ratatui_image::{Resize, ResizeEncodeRender};
+        app.cover.resize_encode(&Resize::Fit(None), Size::new(8, 4));
+        assert!(app.cover.protocol_type().is_none());
+        rx.try_recv().expect("se pidió el redimensionado")
+    }
+
+    /// Completa `request` como el hilo de redimensionado del bucle principal.
+    fn finish_resize(request: ResizeRequest, generation: u64) -> Msg {
+        Msg::Resized {
+            generation,
+            result: request.resize_encode(),
+        }
+    }
+
+    /// El error tardío del redimensionado de la carátula anterior no toca la
+    /// nueva: ni cancela su redimensionado ni gasta su reintento.
+    #[tokio::test]
+    async fn stale_resize_error_does_not_spend_the_retry() {
+        let (mut app, mut rx) = test_app();
+        app.set_cover_image(tiny_image());
+        let _old_request = start_cover_resize(&mut app, &mut rx);
+        let old = app.cover_generation();
+
+        app.set_cover_image(tiny_image());
+        let request = start_cover_resize(&mut app, &mut rx);
+        let current = app.cover_generation();
+        app.on_msg(resize_error(old));
+        assert!(
+            app.cover.protocol_type().is_none(),
+            "sigue redimensionándose"
+        );
+        assert_eq!(app.cover_rebuilds, 0);
+        assert_eq!(status(&app), None);
+
+        app.on_msg(finish_resize(request, current));
+        assert!(
+            app.cover.protocol_type().is_some(),
+            "la respuesta sana vale"
+        );
+        // El reintento sigue disponible para un fallo de verdad.
+        let _ = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(encode_error(&app));
+        assert!(app.has_cover() && app.cover.protocol_type().is_some());
+    }
+
+    /// Un *panic* ajeno (u obsoleto) mientras se redimensiona la carátula no
+    /// la vuelve a preparar: el redimensionado en curso sigue valiendo.
+    #[tokio::test]
+    async fn unrelated_crash_does_not_rebuild_the_cover() {
+        let (mut app, mut rx) = test_app();
+        app.set_cover_image(tiny_image());
+        let request = start_cover_resize(&mut app, &mut rx);
+        let current = app.cover_generation();
+        app.on_msg(crash(CrashOrigin::Other, "fallo en otra tarea"));
+        app.on_msg(crash(
+            CrashOrigin::Resize(current - 1),
+            "redimensionado viejo",
+        ));
+        app.report_crash("al dibujar: fallo simulado");
+        assert!(app.cover.protocol_type().is_none());
+        assert_eq!(app.cover_rebuilds, 0);
+
+        app.on_msg(finish_resize(request, current));
+        assert!(app.cover.protocol_type().is_some());
+    }
+
+    /// Un redimensionado que sale bien devuelve el reintento: un fallo
+    /// pasajero posterior (al cambiar el tamaño de la ventana) no quita la
+    /// carátula.
+    #[tokio::test]
+    async fn successful_resize_restores_the_retry() {
+        let (mut app, mut rx) = test_app();
+        app.set_cover_image(tiny_image());
+        let _ = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(encode_error(&app));
+        assert_eq!(app.cover_rebuilds, 1);
+
+        let request = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(finish_resize(request, app.cover_generation()));
+        assert_eq!(app.cover_rebuilds, 0);
+
+        let _ = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(encode_error(&app));
+        assert!(app.has_cover() && app.cover.protocol_type().is_some());
+        assert_eq!(status(&app), None);
     }
 
     /// Enter sobre un archivo local de una playlist no la reproduce desde el
@@ -2322,7 +2631,7 @@ pub mod tests {
 
 #[cfg(test)]
 mod robustness {
-    use super::tests::test_app;
+    use super::tests::{crash, responses, test_app};
     use super::*;
 
     /// Generador pseudoaleatorio mínimo (reproducible, sin dependencias).
@@ -2403,7 +2712,10 @@ mod robustness {
                 kind: SearchKind::Albums,
                 result: Ok(SearchResults::Contexts(Vec::new())),
             },
-            _ => Msg::Crashed("panic simulado".into()),
+            _ if rng.next().is_multiple_of(2) => {
+                crash(CrashOrigin::List(request), "panic simulado")
+            }
+            _ => crash(CrashOrigin::Other, "panic simulado"),
         }
     }
 
@@ -2429,15 +2741,26 @@ mod robustness {
     #[tokio::test]
     async fn a_panicking_task_is_reported_not_fatal() {
         let (tx, mut rx) = unbounded_channel();
-        spawn_guarded(tx.clone(), async {
+        spawn_guarded(tx.clone(), CrashOrigin::List(7), async {
             panic!("la API devolvió algo imposible")
         });
         match rx.recv().await {
-            Some(Msg::Crashed(reason)) => assert!(reason.contains("imposible")),
-            _ => panic!("se esperaba Msg::Crashed"),
+            Some(Msg::Crashed {
+                origin: CrashOrigin::List(7),
+                reason,
+            }) => assert!(reason.contains("imposible")),
+            _ => panic!("se esperaba Msg::Crashed de la lista 7"),
         }
-        spawn_blocking_guarded(tx, || panic!("fallo al redimensionar"));
-        assert!(matches!(rx.recv().await, Some(Msg::Crashed(_))));
+        spawn_blocking_guarded(tx, CrashOrigin::Resize(3), || {
+            panic!("fallo al redimensionar")
+        });
+        assert!(matches!(
+            rx.recv().await,
+            Some(Msg::Crashed {
+                origin: CrashOrigin::Resize(3),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2453,12 +2776,33 @@ mod robustness {
         assert!(!d.is_pending());
     }
 
+    /// El *panic* de la tarea de una lista llega etiquetado con su petición.
+    #[tokio::test]
+    async fn list_task_panics_are_attributed_to_their_request() {
+        let (mut app, _rx) = test_app();
+        app.begin_request("Cargando…".into());
+        app.spawn_list(|_| async { panic!("página imposible") });
+        let request = app.request_id;
+        let msgs = responses(&mut app).await;
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            Msg::Crashed { origin: CrashOrigin::List(r), reason }
+                if *r == request && reason.contains("imposible")
+        )));
+        for msg in msgs {
+            app.on_msg(msg);
+        }
+        assert!(matches!(app.main, MainContent::Message(_)));
+    }
+
+    /// Si el fallo llega cuando la respuesta de la lista ya se recibió (al
+    /// procesarla), la carga tampoco puede terminar: no se queda «Cargando…».
     #[tokio::test]
     async fn crash_while_loading_leaves_a_usable_screen() {
         let (mut app, _rx) = test_app();
         app.main = MainContent::Loading("Cargando…".into());
         app.playback_inflight = true;
-        app.on_msg(Msg::Crashed("boom".into()));
+        app.report_crash("boom");
         assert!(matches!(app.main, MainContent::Message(_)));
         assert!(
             !app.playback_inflight,

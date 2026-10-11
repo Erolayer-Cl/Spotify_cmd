@@ -6,6 +6,7 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result, bail};
@@ -100,33 +101,64 @@ pub fn load_token(path: &Path, required_scopes: &HashSet<String>) -> Option<Toke
     required_scopes.is_subset(&token.scopes).then_some(token)
 }
 
+/// Intentos de crear un temporal con un nombre libre al guardar el token.
+const TEMP_ATTEMPTS: usize = 8;
+
 /// Guarda el token de forma atómica y legible solo por el usuario: se escribe
 /// en un archivo temporal con permisos 0600 y luego se renombra. Si algo falla
 /// a medias (disco lleno, la app se cierra), el `token.json` anterior sigue
 /// intacto en lugar de quedar vacío.
 pub fn save_token(path: &Path, token: &Token) -> Result<()> {
-    let json = serde_json::to_vec(token).context("no se pudo serializar el token")?;
-    let tmp = temp_path(path);
-    let result = write_private(&tmp, &json).and_then(|()| fs::rename(&tmp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result.with_context(|| format!("no se pudo escribir {}", path.display()))
+    save_token_via(path, token, (0..TEMP_ATTEMPTS).map(|_| temp_path(path)))
 }
 
-/// `token.json` → `token.json.tmp`, en el mismo directorio (para que el
-/// renombrado sea atómico).
+/// Como [`save_token`], usando el primer temporal libre de `temps`. Solo se
+/// borra el temporal creado aquí: uno ocupado es de otra escritura en curso
+/// (otra instancia de la app) y no se toca.
+fn save_token_via(
+    path: &Path,
+    token: &Token,
+    temps: impl IntoIterator<Item = PathBuf>,
+) -> Result<()> {
+    let json = serde_json::to_vec(token).context("no se pudo serializar el token")?;
+    let written = create_temp(temps).and_then(|(tmp, file)| {
+        let result = write_synced(file, &json).and_then(|()| fs::rename(&tmp, path));
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    });
+    written.with_context(|| format!("no se pudo escribir {}", path.display()))
+}
+
+/// `token.json` → `token.json.<pid>.<n>.tmp`, en el mismo directorio (para
+/// que el renombrado sea atómico). El nombre es distinto en cada escritura:
+/// dos instancias, o dos guardados de la misma, no comparten temporal.
 fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut name = path.as_os_str().to_owned();
-    name.push(".tmp");
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
     PathBuf::from(name)
 }
 
-/// Crea `path` desde cero con permisos 0600 y escribe `data` hasta el disco.
-fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    // Un temporal de un intento anterior podría tener otros permisos: se
-    // borra y se crea de nuevo (`create_new` tampoco sigue enlaces simbólicos).
-    let _ = fs::remove_file(path);
+/// Crea el primero de `candidates` que no exista. Si todos existen, devuelve
+/// el error de «ya existe» sin borrar ninguno.
+fn create_temp(candidates: impl IntoIterator<Item = PathBuf>) -> io::Result<(PathBuf, fs::File)> {
+    let mut last = io::Error::new(io::ErrorKind::AlreadyExists, "sin nombre de temporal libre");
+    for tmp in candidates {
+        match create_private(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// Crea `path` desde cero con permisos 0600. Falla si ya existe
+/// (`create_new` tampoco sigue enlaces simbólicos).
+fn create_private(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -134,7 +166,11 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    options.open(path)
+}
+
+/// Escribe `data` en `file` y espera a que llegue al disco.
+fn write_synced(mut file: fs::File, data: &[u8]) -> io::Result<()> {
     file.write_all(data)?;
     file.sync_all()
 }
@@ -236,6 +272,15 @@ mod tests {
         }
     }
 
+    /// Temporales que quedan en `dir` (deberían ser ninguno).
+    fn leftover_temps(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "tmp"))
+            .collect()
+    }
+
     #[cfg(unix)]
     fn mode(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
@@ -255,7 +300,7 @@ mod tests {
         // Sin todos los permisos que pide la app, hay que volver a entrar.
         assert!(load_token(&path, &scopes(&["a", "c"])).is_none());
         // No quedan temporales.
-        assert!(!temp_path(&path).exists());
+        assert!(leftover_temps(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -278,9 +323,12 @@ mod tests {
         let dir = temp_dir("failed_save");
         let path = dir.join("token.json");
         save_token(&path, &token("viejo")).unwrap();
-        // El temporal no se puede crear: ocupa su sitio un directorio.
-        fs::create_dir(temp_path(&path)).unwrap();
-        assert!(save_token(&path, &token("nuevo")).is_err());
+        // El temporal no se puede crear: ocupa su sitio un directorio, que
+        // además no se borra (podría ser de otra escritura).
+        let busy = dir.join("ocupado.tmp");
+        fs::create_dir(&busy).unwrap();
+        assert!(save_token_via(&path, &token("nuevo"), [busy.clone()]).is_err());
+        assert!(busy.is_dir());
         let loaded = load_token(&path, &HashSet::new()).unwrap();
         assert_eq!(loaded.access_token, "viejo");
         let _ = fs::remove_dir_all(&dir);
@@ -294,7 +342,63 @@ mod tests {
         let path = dir.join("token.json");
         fs::create_dir(&path).unwrap();
         assert!(save_token(&path, &token("x")).is_err());
-        assert!(!temp_path(&path).exists());
+        assert!(leftover_temps(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Cada escritura usa su propio temporal, en el mismo directorio.
+    #[test]
+    fn temp_names_are_unique_per_write() {
+        let path = Path::new("/config/token.json");
+        let (a, b) = (temp_path(path), temp_path(path));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), path.parent());
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        let pid = std::process::id().to_string();
+        assert!(name.starts_with(&format!("token.json.{pid}.")));
+        assert!(name.ends_with(".tmp"));
+    }
+
+    /// El temporal de otra instancia que está escribiendo no se borra ni se
+    /// usa: se elige el siguiente nombre libre.
+    #[test]
+    fn temp_of_another_instance_is_left_alone() {
+        let dir = temp_dir("other_instance");
+        let path = dir.join("token.json");
+        let theirs = dir.join("token.json.1.0.tmp");
+        fs::write(&theirs, "a medio escribir").unwrap();
+        let ours = dir.join("token.json.2.0.tmp");
+        save_token_via(&path, &token("nuevo"), [theirs.clone(), ours.clone()]).unwrap();
+
+        assert_eq!(fs::read_to_string(&theirs).unwrap(), "a medio escribir");
+        assert!(!ours.exists(), "el temporal propio se renombró");
+        let loaded = load_token(&path, &HashSet::new()).unwrap();
+        assert_eq!(loaded.access_token, "nuevo");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Varias escrituras a la vez (dos instancias de la app) no se pisan el
+    /// temporal: todas terminan bien y `token.json` siempre es válido.
+    #[test]
+    fn concurrent_saves_never_publish_a_partial_token() {
+        let dir = temp_dir("concurrent");
+        let path = dir.join("token.json");
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for j in 0..25 {
+                        save_token(&path, &token(&format!("{i}-{j}"))).unwrap();
+                        assert!(load_token(&path, &HashSet::new()).is_some());
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert!(load_token(&path, &HashSet::new()).is_some());
+        assert!(leftover_temps(&dir).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

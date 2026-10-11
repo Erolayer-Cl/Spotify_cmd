@@ -150,8 +150,9 @@ fn client_config(cache_path: std::path::PathBuf) -> rspotify::Config {
     rs_config
 }
 
-/// Guarda el token nuevo. Si no se puede, la sesión sigue en memoria: se avisa
-/// de que habrá que volver a entrar la próxima vez, pero la app arranca.
+/// Guarda el token nuevo (la escritura va a un hilo aparte: ver
+/// [`spotify::save_session`]). Si no se puede, la sesión sigue en memoria: se
+/// avisa de que habrá que volver a entrar la próxima vez, pero la app arranca.
 async fn save_session_or_warn(spotify: &AuthCodePkceSpotify) {
     if let Err(e) = spotify::save_session(spotify).await {
         say_err!(

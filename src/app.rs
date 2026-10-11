@@ -18,6 +18,7 @@ use rspotify::model::RepeatState;
 use rspotify::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::keymap::{Command, command_for, step_index};
 use crate::spotify::{
     self, Action, ApiError, Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind,
     SearchResults, TrackEntry,
@@ -758,84 +759,61 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let command = command_for(key);
+        if command == Some(Command::Quit) && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return;
         }
-
-        match &mut self.popup {
-            Popup::Search => return self.on_search_key(key),
-            Popup::Help => {
-                self.popup = Popup::None;
-                return;
-            }
-            Popup::Devices { devices, state } => {
-                let len = devices.as_ref().map_or(0, Vec::len);
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => {
-                        self.popup = Popup::None
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => move_list(state, len, -1),
-                    KeyCode::Down | KeyCode::Char('j') => move_list(state, len, 1),
-                    KeyCode::Enter => {
-                        let device = state
-                            .selected()
-                            .and_then(|i| devices.as_ref().and_then(|d| d.get(i)))
-                            .and_then(|d| d.id.clone());
-                        self.popup = Popup::None;
-                        match device {
-                            Some(device_id) => self.do_action(Action::Transfer { device_id }),
-                            None => self.set_status("Ese dispositivo no se puede controlar", true),
-                        }
-                    }
-                    _ => {}
+        match self.popup {
+            Popup::Search => self.on_search_key(key),
+            Popup::Help => self.popup = Popup::None,
+            Popup::Devices { .. } => {
+                if let Some(command) = command {
+                    self.on_devices_command(command);
                 }
-                return;
             }
-            Popup::None => {}
+            Popup::None => {
+                if let Some(command) = command {
+                    self.run(command);
+                }
+            }
         }
+    }
 
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char(' ') => self.toggle_play(),
-            KeyCode::Char('n') => {
-                self.set_status("Siguiente ⏭", false);
-                self.do_action(Action::Next);
-            }
-            KeyCode::Char('p') => {
-                self.set_status("Anterior ⏮", false);
-                self.do_action(Action::Previous);
-            }
-            KeyCode::Right => self.seek(true),
-            KeyCode::Left => self.seek(false),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.change_volume(VOLUME_STEP),
-            KeyCode::Char('-') => self.change_volume(-VOLUME_STEP),
-            KeyCode::Char('s') => self.toggle_shuffle(),
-            KeyCode::Char('r') => self.cycle_repeat(),
-            KeyCode::Char('/') => self.popup = Popup::Search,
-            KeyCode::Char('d') => self.open_devices(),
-            KeyCode::Char('c') => self.big_cover = !self.big_cover,
-            KeyCode::Char('?') | KeyCode::F(1) => self.popup = Popup::Help,
-            KeyCode::F(5) | KeyCode::Char('R') => {
+    /// Ejecuta una orden de la pantalla principal.
+    fn run(&mut self, command: Command) {
+        use Command::*;
+        match command {
+            Quit => self.should_quit = true,
+            Back => {}
+            TogglePlay => self.toggle_play(),
+            Next => self.skip(Action::Next, "Siguiente ⏭"),
+            Previous => self.skip(Action::Previous, "Anterior ⏮"),
+            SeekForward => self.seek(true),
+            SeekBackward => self.seek(false),
+            VolumeUp => self.change_volume(VOLUME_STEP),
+            VolumeDown => self.change_volume(-VOLUME_STEP),
+            ToggleShuffle => self.toggle_shuffle(),
+            CycleRepeat => self.cycle_repeat(),
+            OpenSearch => self.popup = Popup::Search,
+            OpenDevices => self.open_devices(),
+            ToggleCover => self.big_cover = !self.big_cover,
+            ShowHelp => self.popup = Popup::Help,
+            Refresh => {
                 self.load_playlists();
                 self.poll_playback();
                 self.set_status("Actualizando…", false);
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            SwitchFocus => {
                 self.focus = match self.focus {
                     Focus::Library => Focus::Main,
                     Focus::Main => Focus::Library,
                 }
             }
-            KeyCode::Char('a') => self.queue_selected(),
-            KeyCode::Char('o') => self.open_selected(),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-            KeyCode::PageUp => self.move_selection(-10),
-            KeyCode::PageDown => self.move_selection(10),
-            KeyCode::Home | KeyCode::Char('g') => self.move_selection(i32::MIN / 2),
-            KeyCode::End | KeyCode::Char('G') => self.move_selection(i32::MAX / 2),
-            KeyCode::Enter => match self.focus {
+            QueueSelected => self.queue_selected(),
+            OpenSelected => self.open_selected(),
+            Move(_) | Jump(_) => self.move_selection(command),
+            Activate => match self.focus {
                 Focus::Library => {
                     if let Some(item) = self
                         .library_state
@@ -847,10 +825,40 @@ impl App {
                 }
                 Focus::Main => self.activate_main(),
             },
+        }
+    }
+
+    fn skip(&mut self, action: Action, label: &str) {
+        self.set_status(label, false);
+        self.do_action(action);
+    }
+
+    fn on_devices_command(&mut self, command: Command) {
+        let Popup::Devices { devices, state } = &mut self.popup else {
+            return;
+        };
+        match command {
+            Command::Back | Command::Quit | Command::OpenDevices => self.popup = Popup::None,
+            Command::Move(_) | Command::Jump(_) => {
+                let len = devices.as_ref().map_or(0, Vec::len);
+                state.select(step_index(state.selected(), len, command));
+            }
+            Command::Activate => {
+                let device = state
+                    .selected()
+                    .and_then(|i| devices.as_ref().and_then(|d| d.get(i)))
+                    .and_then(|d| d.id.clone());
+                self.popup = Popup::None;
+                match device {
+                    Some(device_id) => self.do_action(Action::Transfer { device_id }),
+                    None => self.set_status("Ese dispositivo no se puede controlar", true),
+                }
+            }
             _ => {}
         }
     }
 
+    /// En el buscador las teclas escriben texto en vez de ejecutar órdenes.
     fn on_search_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => self.popup = Popup::None,
@@ -871,32 +879,20 @@ impl App {
         }
     }
 
-    fn move_selection(&mut self, delta: i32) {
+    fn move_selection(&mut self, command: Command) {
         match self.focus {
             Focus::Library => {
                 let len = self.library_len();
-                move_list(&mut self.library_state, len, delta);
+                let next = step_index(self.library_state.selected(), len, command);
+                self.library_state.select(next);
             }
             Focus::Main => {
                 let len = self.main_len();
-                if len == 0 {
-                    return;
-                }
-                let cur = self.main_state.selected().unwrap_or(0) as i64;
-                let next = (cur + delta as i64).clamp(0, len as i64 - 1);
-                self.main_state.select(Some(next as usize));
+                let next = step_index(self.main_state.selected(), len, command);
+                self.main_state.select(next);
             }
         }
     }
-}
-
-fn move_list(state: &mut ListState, len: usize, delta: i32) {
-    if len == 0 {
-        return;
-    }
-    let cur = state.selected().unwrap_or(0) as i64;
-    let next = (cur + delta as i64).clamp(0, len as i64 - 1);
-    state.select(Some(next as usize));
 }
 
 pub fn repeat_label(state: RepeatState) -> &'static str {

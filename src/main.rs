@@ -3,7 +3,10 @@
 mod app;
 mod auth;
 mod config;
+mod keymap;
+mod logo;
 mod spotify;
+mod theme;
 mod ui;
 
 use std::time::Duration;
@@ -61,7 +64,8 @@ fn parse_args() -> Result<Option<Args>> {
                 return Ok(None);
             }
             "-h" | "--help" => {
-                println!("{HELP}");
+                print!("{}", logo::banner());
+                println!("\n{HELP}");
                 return Ok(None);
             }
             "-V" | "--version" => {
@@ -87,6 +91,7 @@ async fn try_main() -> Result<()> {
         return Ok(());
     };
 
+    print!("{}", logo::banner());
     let cfg = config::Config::load_or_create()?;
     let spotify = auth::authenticate(&cfg, args.manual_auth).await?;
 

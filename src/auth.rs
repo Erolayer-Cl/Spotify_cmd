@@ -16,6 +16,7 @@ use tokio::{
 };
 
 use crate::config::{self, Config};
+use crate::logo;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -63,7 +64,10 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         .context("no se pudo generar la URL de autorización")?;
 
     println!("Inicia sesión en Spotify para autorizar spotify_cmd.\n");
-    println!("Si el navegador no se abre solo, visita esta URL:\n\n  {url}\n");
+    println!(
+        "Si el navegador no se abre solo, visita esta URL:\n\n  {}\n",
+        logo::green(&url)
+    );
 
     let listen_addr = spotify.get_socket_address(&spotify.oauth.redirect_uri);
     let code = match listen_addr {
@@ -90,7 +94,7 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         .request_token(&code)
         .await
         .context("Spotify rechazó el código de autorización")?;
-    println!("¡Sesión iniciada!");
+    println!("{}", logo::green("¡Sesión iniciada!"));
     Ok(spotify)
 }
 

@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::logo;
+
 pub const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8888/callback";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +69,10 @@ impl Config {
         } else {
             let config = Self::ask_interactively()?;
             config.save()?;
-            println!("Configuración guardada en {}\n", path.display());
+            println!(
+                "{}\n",
+                logo::green(&format!("Configuración guardada en {}", path.display()))
+            );
             config
         };
 
@@ -95,7 +100,7 @@ impl Config {
     }
 
     fn ask_interactively() -> Result<Self> {
-        println!("=== spotify_cmd: configuración inicial ===\n");
+        println!("{}\n", logo::green("=== Configuración inicial ==="));
         println!("Necesitas una app de Spotify (gratis) para conectar esta herramienta:");
         println!("  1. Entra en https://developer.spotify.com/dashboard y pulsa \"Create app\".");
         println!("  2. En \"Redirect URIs\" añade exactamente: {DEFAULT_REDIRECT_URI}");

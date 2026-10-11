@@ -1,31 +1,33 @@
 //! Dibujado de la interfaz con ratatui.
+//!
+//! Cada zona de la pantalla tiene su propia función `draw_*`, y las piezas que
+//! se repiten (paneles, tablas, logo, atajos) son funciones pequeñas
+//! reutilizables. Los colores salen de [`crate::theme`].
 
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Flex, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Cell, Clear, LineGauge, List, ListItem, Paragraph, Row, Table, Wrap,
-    },
+    widgets::{Cell, Clear, LineGauge, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
 };
 use ratatui_image::{FilterType, Resize, StatefulImage};
+use rspotify::model::RepeatState;
 
 use crate::app::{App, FIXED_LIBRARY, Focus, LibraryItem, MainContent, Popup, repeat_label};
-use crate::spotify::SearchKind;
+use crate::logo::{LOGO_LARGE, LOGO_SMALL};
+use crate::spotify::{Playback, SearchKind, TrackEntry};
+use crate::theme;
 
-const GREEN: Color = Color::Rgb(30, 215, 96);
-const DIM: Color = Color::Rgb(140, 140, 140);
-const SELECT_BG: Color = Color::Rgb(40, 40, 40);
+/// Alto del panel "Reproduciendo" (borde incluido).
+const PLAYER_HEIGHT: u16 = 11;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [body, player, footer] = Layout::vertical([
         Constraint::Min(8),
-        Constraint::Length(11),
+        Constraint::Length(PLAYER_HEIGHT),
         Constraint::Length(1),
     ])
     .areas(f.area());
-
     let [library, main] =
         Layout::horizontal([Constraint::Percentage(26), Constraint::Percentage(74)]).areas(body);
 
@@ -46,13 +48,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if focused { GREEN } else { DIM }))
-        .title(title)
-}
+// ---------------------------------------------------------------------------
+// Piezas reutilizables
+// ---------------------------------------------------------------------------
 
+/// "3:45" o "1:02:03".
 fn fmt_ms(ms: u64) -> String {
     let s = ms / 1000;
     if s >= 3600 {
@@ -62,412 +62,12 @@ fn fmt_ms(ms: u64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Biblioteca (lateral)
-// ---------------------------------------------------------------------------
-
-fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Library && matches!(app.popup, Popup::None);
-    let mut items: Vec<ListItem> = FIXED_LIBRARY
-        .iter()
-        .map(|item| {
-            let (icon, name) = match item {
-                LibraryItem::Liked => ("♥", "Tus me gusta"),
-                LibraryItem::Recent => ("◷", "Recientes"),
-                LibraryItem::Queue => ("≡", "Cola"),
-                LibraryItem::Playlist(_) => unreachable!(),
-            };
-            library_line(
-                icon,
-                name.to_string(),
-                None,
-                app.active_library == Some(*item),
-            )
-        })
-        .collect();
-
-    items.extend(app.playlists.iter().enumerate().map(|(i, p)| {
-        library_line(
-            "♫",
-            p.name.clone(),
-            Some(p.total),
-            app.active_library == Some(LibraryItem::Playlist(i)),
-        )
-    }));
-
-    let title = if app.playlists.is_empty() {
-        " Biblioteca ".to_string()
-    } else {
-        format!(" Biblioteca · {} playlists ", app.playlists.len())
-    };
-    let list = List::new(items)
-        .block(panel(title, focused))
-        .highlight_style(Style::new().bg(SELECT_BG).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▌");
-    f.render_stateful_widget(list, area, &mut app.library_state);
+/// Un panel tiene el foco si es el activo y no hay ninguna ventana encima.
+fn has_focus(app: &App, panel: Focus) -> bool {
+    app.focus == panel && matches!(app.popup, Popup::None)
 }
 
-fn library_line(
-    icon: &'static str,
-    name: String,
-    total: Option<u32>,
-    active: bool,
-) -> ListItem<'static> {
-    let color = if active { GREEN } else { Color::Reset };
-    let mut spans = vec![
-        Span::styled(format!("{icon} "), Style::new().fg(GREEN)),
-        Span::styled(name, Style::new().fg(color)),
-    ];
-    if let Some(total) = total {
-        spans.push(Span::styled(format!(" {total}"), Style::new().fg(DIM)));
-    }
-    ListItem::new(Line::from(spans))
-}
-
-// ---------------------------------------------------------------------------
-// Lista principal
-// ---------------------------------------------------------------------------
-
-fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Main && matches!(app.popup, Popup::None);
-    let playing_uri = app.playback.as_ref().and_then(|p| p.item_uri.clone());
-
-    match &app.main {
-        MainContent::Loading(text) | MainContent::Message(text) => {
-            let block = panel(" Lista ", focused);
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-            let [_, text_area] =
-                Layout::vertical([Constraint::Percentage(35), Constraint::Fill(1)]).areas(inner);
-            let p = Paragraph::new(text.clone())
-                .style(Style::new().fg(DIM))
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true });
-            f.render_widget(p, text_area);
-        }
-        MainContent::Tracks { title, tracks, .. } => {
-            let rows = tracks.iter().enumerate().map(|(i, t)| {
-                let is_playing = playing_uri.is_some() && t.uri() == playing_uri;
-                let num = if is_playing {
-                    "♪".to_string()
-                } else {
-                    (i + 1).to_string()
-                };
-                let style = if is_playing {
-                    Style::new().fg(GREEN).add_modifier(Modifier::BOLD)
-                } else if t.id.is_none() {
-                    Style::new().fg(DIM)
-                } else {
-                    Style::new()
-                };
-                Row::new(vec![
-                    Cell::from(num).style(Style::new().fg(if is_playing { GREEN } else { DIM })),
-                    Cell::from(t.name.clone()),
-                    Cell::from(t.artists.clone()).style(Style::new().fg(if is_playing {
-                        GREEN
-                    } else {
-                        Color::Gray
-                    })),
-                    Cell::from(t.album.clone()).style(Style::new().fg(DIM)),
-                    Cell::from(fmt_ms(t.duration_ms)).style(Style::new().fg(DIM)),
-                ])
-                .style(style)
-            });
-            let header = Row::new(["#", "Título", "Artista", "Álbum", "Dur."])
-                .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD))
-                .bottom_margin(1);
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(4),
-                    Constraint::Percentage(38),
-                    Constraint::Percentage(27),
-                    Constraint::Percentage(25),
-                    Constraint::Length(7),
-                ],
-            )
-            .header(header)
-            .block(panel(format!(" {title} · {} ", tracks.len()), focused))
-            .row_highlight_style(Style::new().bg(SELECT_BG).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▌");
-            f.render_stateful_widget(table, area, &mut app.main_state);
-        }
-        MainContent::Contexts { title, kind, items } => {
-            let icon = match kind {
-                SearchKind::Albums => "◉",
-                SearchKind::Artists => "☺",
-                SearchKind::Playlists => "♫",
-                SearchKind::Tracks => "♪",
-            };
-            let rows = items.iter().map(|c| {
-                Row::new(vec![
-                    Cell::from(icon).style(Style::new().fg(GREEN)),
-                    Cell::from(c.name.clone()),
-                    Cell::from(c.detail.clone()).style(Style::new().fg(DIM)),
-                ])
-            });
-            let header = Row::new(["", "Nombre", "Detalle"])
-                .style(Style::new().fg(DIM).add_modifier(Modifier::BOLD))
-                .bottom_margin(1);
-            let table = Table::new(
-                rows,
-                [
-                    Constraint::Length(2),
-                    Constraint::Percentage(50),
-                    Constraint::Percentage(50),
-                ],
-            )
-            .header(header)
-            .block(panel(format!(" {title} "), focused))
-            .row_highlight_style(Style::new().bg(SELECT_BG).add_modifier(Modifier::BOLD))
-            .highlight_symbol("▌");
-            f.render_stateful_widget(table, area, &mut app.main_state);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reproductor
-// ---------------------------------------------------------------------------
-
-fn draw_player(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = panel(" Reproduciendo ", false);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let info_area = if app.big_cover {
-        inner
-    } else {
-        // Las celdas de la terminal son ~el doble de altas que anchas: un
-        // cuadrado de N filas ocupa ~2N columnas.
-        let cover_w = (inner.height * 2 + 1).min(inner.width / 3);
-        let [cover, _gap, info] = Layout::horizontal([
-            Constraint::Length(cover_w),
-            Constraint::Length(2),
-            Constraint::Min(10),
-        ])
-        .areas(inner);
-        draw_cover(f, app, cover);
-        info
-    };
-
-    let Some(pb) = &app.playback else {
-        let lines = vec![
-            Line::from(""),
-            Line::from("No hay nada reproduciéndose.".bold()),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Abre Spotify en cualquier dispositivo, o elige una canción y pulsa Enter.",
-                Style::new().fg(DIM),
-            )),
-            Line::from(Span::styled(
-                "Pulsa 'd' para elegir el dispositivo donde reproducir.",
-                Style::new().fg(DIM),
-            )),
-        ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info_area);
-        return;
-    };
-
-    let [text_area, _, gauge_area] = Layout::vertical([
-        Constraint::Min(5),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(info_area);
-
-    let state = if pb.is_playing {
-        Span::styled("▶ Reproduciendo", Style::new().fg(GREEN).bold())
-    } else {
-        Span::styled("⏸ En pausa", Style::new().fg(Color::Yellow).bold())
-    };
-    let on_off = |on: bool| {
-        if on {
-            Style::new().fg(GREEN)
-        } else {
-            Style::new().fg(DIM)
-        }
-    };
-    let sep = || Span::styled("   ", Style::new());
-    let mut status = vec![
-        state,
-        sep(),
-        Span::styled(
-            format!("⇄ Aleatorio: {}", if pb.shuffle { "sí" } else { "no" }),
-            on_off(pb.shuffle),
-        ),
-        sep(),
-        Span::styled(
-            format!("↻ Repetir: {}", repeat_label(pb.repeat)),
-            on_off(pb.repeat != rspotify::model::RepeatState::Off),
-        ),
-    ];
-    if let Some(v) = pb.volume {
-        status.push(sep());
-        status.push(Span::styled(
-            format!("Vol {v}%"),
-            Style::new().fg(Color::Gray),
-        ));
-    }
-
-    let lines = vec![
-        Line::from(Span::styled(
-            pb.title.clone(),
-            Style::new().fg(Color::White).bold(),
-        )),
-        Line::from(Span::styled(pb.artists.clone(), Style::new().fg(GREEN))),
-        Line::from(Span::styled(
-            pb.album.clone(),
-            Style::new().fg(DIM).italic(),
-        )),
-        Line::from(""),
-        Line::from(status),
-        Line::from(Span::styled(
-            format!("Dispositivo: {} ({})", pb.device_name, pb.device_type),
-            Style::new().fg(DIM),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines), text_area);
-
-    let progress = pb.current_progress_ms();
-    let ratio = if pb.duration_ms > 0 {
-        (progress as f64 / pb.duration_ms as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let gauge = LineGauge::default()
-        .ratio(ratio)
-        .label(format!(
-            "{} / {} ",
-            fmt_ms(progress),
-            fmt_ms(pb.duration_ms)
-        ))
-        .filled_symbol("━")
-        .unfilled_symbol("─")
-        .filled_style(Style::new().fg(GREEN))
-        .unfilled_style(Style::new().fg(Color::Rgb(70, 70, 70)));
-    f.render_widget(gauge, gauge_area);
-}
-
-fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
-    if area.width < 2 || area.height < 2 {
-        return;
-    }
-    if app.cover.protocol_type().is_none() {
-        // Marcador mientras se descarga la carátula (o si no hay ninguna).
-        let placeholder = Paragraph::new(vec![Line::from(""), Line::from("♪").fg(DIM)])
-            .alignment(Alignment::Center)
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().fg(DIM)),
-            );
-        f.render_widget(placeholder, area);
-        return;
-    }
-    // `Scale` amplía también las imágenes pequeñas para ocupar todo el hueco.
-    let widget = StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle)));
-    f.render_stateful_widget(widget, area, &mut app.cover);
-}
-
-fn draw_big_cover(f: &mut Frame, app: &mut App, area: Rect) {
-    let block = panel(" Carátula (c para volver) ", app.focus == Focus::Main);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    // Cuadrado lo más grande posible, centrado.
-    let side_h = inner.height.min(inner.width / 2);
-    let side_w = side_h * 2;
-    let [_, col, _] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(side_w),
-        Constraint::Fill(1),
-    ])
-    .areas(inner);
-    let [_, cell, _] = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(side_h),
-        Constraint::Fill(1),
-    ])
-    .areas(col);
-    draw_cover(f, app, cell);
-}
-
-// ---------------------------------------------------------------------------
-// Pie, buscador y ventanas emergentes
-// ---------------------------------------------------------------------------
-
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    if let Some(status) = app.visible_status() {
-        let style = if status.error {
-            Style::new().fg(Color::Red).bold()
-        } else {
-            Style::new().fg(GREEN)
-        };
-        f.render_widget(
-            Paragraph::new(Span::styled(format!(" {}", status.text), style)),
-            area,
-        );
-        return;
-    }
-    let keys: &[(&str, &str)] = &[
-        ("espacio", "play/pausa"),
-        ("n/p", "sig/ant"),
-        ("/", "buscar"),
-        ("?", "ayuda"),
-        ("q", "salir"),
-        ("←/→", "±10s"),
-        ("s", "aleatorio"),
-        ("r", "repetir"),
-        ("+/-", "vol"),
-        ("c", "carátula"),
-        ("d", "dispositivos"),
-    ];
-    let mut spans = Vec::new();
-    for (k, v) in keys {
-        spans.push(Span::styled(
-            format!(" {k} "),
-            Style::new().fg(Color::Black).bg(GREEN),
-        ));
-        spans.push(Span::styled(format!(" {v} "), Style::new().fg(DIM)));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn draw_search(f: &mut Frame, app: &App, main: Rect) {
-    let area = Rect {
-        height: 4.min(main.height),
-        ..main
-    };
-    f.render_widget(Clear, area);
-
-    let mut tabs = vec![Span::raw(" ")];
-    for kind in SearchKind::ALL {
-        let style = if kind == app.search_kind {
-            Style::new().fg(Color::Black).bg(GREEN).bold()
-        } else {
-            Style::new().fg(DIM)
-        };
-        tabs.push(Span::styled(format!(" {} ", kind.label()), style));
-        tabs.push(Span::raw(" "));
-    }
-
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(GREEN))
-        .title(" Buscar ")
-        .title_bottom(Line::from(" Tab: tipo · Enter: buscar · Esc: cerrar ").right_aligned());
-    let lines = vec![
-        Line::from(tabs),
-        Line::from(vec![
-            Span::styled(" › ", Style::new().fg(GREEN).bold()),
-            Span::raw(app.search_input.clone()),
-            Span::styled("█", Style::new().fg(GREEN)),
-        ]),
-    ];
-    f.render_widget(Paragraph::new(lines).block(block), area);
-}
-
+/// Rectángulo de `width × height` centrado dentro de `area`.
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [v] = Layout::vertical([Constraint::Length(height.min(area.height))])
         .flex(Flex::Center)
@@ -478,25 +78,448 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     h
 }
 
+/// Logo de Spotify en verde, como líneas listas para un `Paragraph`.
+fn logo_lines(rows: &[&'static str]) -> Vec<Line<'static>> {
+    rows.iter()
+        .map(|row| Line::styled(*row, theme::text()))
+        .collect()
+}
+
+/// Logo centrado con un mensaje debajo (pantallas vacías o de carga).
+fn draw_logo_message(f: &mut Frame, area: Rect, message: &str) {
+    let logo: &[&str] = if area.height >= LOGO_LARGE.len() as u16 + 4 {
+        &LOGO_LARGE
+    } else {
+        &LOGO_SMALL
+    };
+    let mut lines = logo_lines(logo);
+    lines.push(Line::raw(""));
+    lines.extend(
+        message
+            .lines()
+            .map(|l| Line::styled(l.to_string(), theme::soft())),
+    );
+    let height = lines.len() as u16;
+    let area = centered(area, area.width, height);
+    let p = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// Tabla con cabecera, selección y estilo comunes a todas las listas.
+fn styled_table<'a>(
+    rows: Vec<Row<'a>>,
+    widths: &[Constraint],
+    header: &[&'a str],
+    title: String,
+    focused: bool,
+) -> Table<'a> {
+    let header = Row::new(header.to_vec())
+        .style(theme::dim().add_modifier(ratatui::style::Modifier::BOLD))
+        .bottom_margin(1);
+    Table::new(rows, widths.to_vec())
+        .header(header)
+        .block(theme::panel(title, focused))
+        .style(theme::text())
+        .row_highlight_style(theme::selected())
+        .highlight_symbol("▌")
+}
+
+fn render_table(f: &mut Frame, table: Table, area: Rect, state: &mut TableState) {
+    f.render_stateful_widget(table, area, state);
+}
+
+// ---------------------------------------------------------------------------
+// Biblioteca (lateral)
+// ---------------------------------------------------------------------------
+
+fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
+    let fixed = FIXED_LIBRARY.iter().map(|item| {
+        let (icon, name) = match item {
+            LibraryItem::Liked => ("♥", "Tus me gusta"),
+            LibraryItem::Recent => ("◷", "Recientes"),
+            LibraryItem::Queue => ("≡", "Cola"),
+            LibraryItem::Playlist(_) => unreachable!("FIXED_LIBRARY no contiene playlists"),
+        };
+        library_line(
+            icon,
+            name.to_string(),
+            None,
+            app.active_library == Some(*item),
+        )
+    });
+    let playlists = app.playlists.iter().enumerate().map(|(i, p)| {
+        let active = app.active_library == Some(LibraryItem::Playlist(i));
+        library_line("♫", p.name.clone(), Some(p.total), active)
+    });
+    let items: Vec<ListItem> = fixed.chain(playlists).collect();
+
+    let title = match app.playlists.len() {
+        0 => " Biblioteca ".to_string(),
+        n => format!(" Biblioteca · {n} playlists "),
+    };
+    let list = List::new(items)
+        .block(theme::panel(title, has_focus(app, Focus::Library)))
+        .highlight_style(theme::selected())
+        .highlight_symbol("▌");
+    f.render_stateful_widget(list, area, &mut app.library_state);
+}
+
+fn library_line(
+    icon: &'static str,
+    name: String,
+    total: Option<u32>,
+    active: bool,
+) -> ListItem<'static> {
+    let mut spans = vec![
+        Span::styled(format!("{icon} "), theme::text()),
+        Span::styled(
+            name,
+            if active {
+                theme::strong()
+            } else {
+                theme::soft()
+            },
+        ),
+    ];
+    if let Some(total) = total {
+        spans.push(Span::styled(format!(" {total}"), theme::dim()));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+// ---------------------------------------------------------------------------
+// Lista principal
+// ---------------------------------------------------------------------------
+
+fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
+    let focused = has_focus(app, Focus::Main);
+    let playing_uri = app.playback.as_ref().and_then(|p| p.item_uri.clone());
+
+    match &app.main {
+        MainContent::Loading(text) | MainContent::Message(text) => {
+            let block = theme::panel(" Lista ", focused);
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            draw_logo_message(f, inner, text);
+        }
+        MainContent::Tracks { title, tracks, .. } => {
+            let rows = tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| track_row(i, t, playing_uri.is_some() && t.uri() == playing_uri))
+                .collect();
+            let widths = [
+                Constraint::Length(4),
+                Constraint::Percentage(38),
+                Constraint::Percentage(27),
+                Constraint::Percentage(25),
+                Constraint::Length(7),
+            ];
+            let header = ["#", "Título", "Artista", "Álbum", "Dur."];
+            let title = format!(" {title} · {} ", tracks.len());
+            let table = styled_table(rows, &widths, &header, title, focused);
+            render_table(f, table, area, &mut app.main_state);
+        }
+        MainContent::Contexts { title, kind, items } => {
+            let icon = search_icon(*kind);
+            let rows = items
+                .iter()
+                .map(|c| {
+                    Row::new(vec![
+                        Cell::from(icon).style(theme::text()),
+                        Cell::from(c.name.clone()),
+                        Cell::from(c.detail.clone()).style(theme::dim()),
+                    ])
+                })
+                .collect();
+            let widths = [
+                Constraint::Length(2),
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ];
+            let table = styled_table(
+                rows,
+                &widths,
+                &["", "Nombre", "Detalle"],
+                format!(" {title} "),
+                focused,
+            );
+            render_table(f, table, area, &mut app.main_state);
+        }
+    }
+}
+
+/// Fila de una canción; la que está sonando se marca con ♪ y en negrita.
+fn track_row(index: usize, track: &TrackEntry, is_playing: bool) -> Row<'static> {
+    let number = if is_playing {
+        "♪".to_string()
+    } else {
+        (index + 1).to_string()
+    };
+    let base = if is_playing {
+        theme::strong()
+    } else if track.id.is_none() {
+        theme::dim()
+    } else {
+        theme::text()
+    };
+    let secondary = if is_playing {
+        theme::strong()
+    } else {
+        theme::soft()
+    };
+    Row::new(vec![
+        Cell::from(number).style(if is_playing {
+            theme::strong()
+        } else {
+            theme::dim()
+        }),
+        Cell::from(track.name.clone()),
+        Cell::from(track.artists.clone()).style(secondary),
+        Cell::from(track.album.clone()).style(theme::dim()),
+        Cell::from(fmt_ms(track.duration_ms)).style(theme::dim()),
+    ])
+    .style(base)
+}
+
+fn search_icon(kind: SearchKind) -> &'static str {
+    match kind {
+        SearchKind::Albums => "◉",
+        SearchKind::Artists => "☺",
+        SearchKind::Playlists => "♫",
+        SearchKind::Tracks => "♪",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reproductor
+// ---------------------------------------------------------------------------
+
+fn draw_player(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = theme::panel(" Reproduciendo ", false);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let info_area = if app.big_cover {
+        inner
+    } else {
+        // Las celdas de la terminal son ~el doble de altas que anchas: un
+        // cuadrado de N filas ocupa ~2N columnas.
+        let cover_w = (inner.height * 2).min(inner.width / 3);
+        let [cover, _gap, info] = Layout::horizontal([
+            Constraint::Length(cover_w),
+            Constraint::Length(2),
+            Constraint::Min(10),
+        ])
+        .areas(inner);
+        draw_cover(f, app, cover);
+        info
+    };
+
+    match &app.playback {
+        Some(pb) => draw_now_playing(f, pb, info_area),
+        None => draw_nothing_playing(f, info_area),
+    }
+}
+
+fn draw_nothing_playing(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::raw(""),
+        Line::styled("No hay nada reproduciéndose.", theme::strong()),
+        Line::raw(""),
+        Line::styled(
+            "Abre Spotify en cualquier dispositivo, o elige una canción y pulsa Enter.",
+            theme::soft(),
+        ),
+        Line::styled(
+            "Pulsa 'd' para elegir el dispositivo donde reproducir.",
+            theme::dim(),
+        ),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn draw_now_playing(f: &mut Frame, pb: &Playback, area: Rect) {
+    let [text_area, _, gauge_area] = Layout::vertical([
+        Constraint::Min(5),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    let lines = vec![
+        Line::styled(pb.title.clone(), theme::strong()),
+        Line::styled(pb.artists.clone(), theme::text()),
+        Line::styled(pb.album.clone(), theme::soft().italic()),
+        Line::raw(""),
+        status_line(pb),
+        Line::styled(
+            format!("Dispositivo: {} ({})", pb.device_name, pb.device_type),
+            theme::dim(),
+        ),
+    ];
+    f.render_widget(Paragraph::new(lines), text_area);
+    f.render_widget(progress_bar(pb), gauge_area);
+}
+
+/// "▶ Reproduciendo   ⇄ Aleatorio: sí   ↻ Repetir: lista   Vol 65%".
+fn status_line(pb: &Playback) -> Line<'static> {
+    let state = if pb.is_playing {
+        Span::styled("▶ Reproduciendo", theme::strong())
+    } else {
+        Span::styled("⏸ En pausa", theme::warning())
+    };
+    let gap = || Span::raw("   ");
+    let mut spans = vec![
+        state,
+        gap(),
+        Span::styled(
+            format!("⇄ Aleatorio: {}", if pb.shuffle { "sí" } else { "no" }),
+            theme::toggle(pb.shuffle),
+        ),
+        gap(),
+        Span::styled(
+            format!("↻ Repetir: {}", repeat_label(pb.repeat)),
+            theme::toggle(pb.repeat != RepeatState::Off),
+        ),
+    ];
+    if let Some(volume) = pb.volume {
+        spans.extend([gap(), Span::styled(format!("Vol {volume}%"), theme::soft())]);
+    }
+    Line::from(spans)
+}
+
+fn progress_bar(pb: &Playback) -> LineGauge<'static> {
+    let progress = pb.current_progress_ms();
+    let ratio = if pb.duration_ms > 0 {
+        (progress as f64 / pb.duration_ms as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    LineGauge::default()
+        .ratio(ratio)
+        .label(Span::styled(
+            format!("{} / {} ", fmt_ms(progress), fmt_ms(pb.duration_ms)),
+            theme::text(),
+        ))
+        .filled_symbol("━")
+        .unfilled_symbol("─")
+        .filled_style(theme::text())
+        .unfilled_style(ratatui::style::Style::new().fg(theme::TRACK_BG))
+}
+
+fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    if app.cover.protocol_type().is_none() {
+        // Sin carátula (cargando o nada sonando): el logo de Spotify.
+        let logo = Paragraph::new(logo_lines(&LOGO_SMALL)).alignment(Alignment::Center);
+        let height = (LOGO_SMALL.len() as u16).min(area.height);
+        f.render_widget(logo, centered(area, area.width, height));
+        return;
+    }
+    // `Scale` amplía también las imágenes pequeñas para ocupar todo el hueco.
+    let widget = StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle)));
+    f.render_stateful_widget(widget, area, &mut app.cover);
+}
+
+fn draw_big_cover(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = theme::panel(" Carátula (c para volver) ", has_focus(app, Focus::Main));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Cuadrado lo más grande posible, centrado.
+    let side = inner.height.min(inner.width / 2);
+    draw_cover(f, app, centered(inner, side * 2, side));
+}
+
+// ---------------------------------------------------------------------------
+// Pie, buscador y ventanas emergentes
+// ---------------------------------------------------------------------------
+
+const FOOTER_KEYS: [(&str, &str); 11] = [
+    ("espacio", "play/pausa"),
+    ("n/p", "sig/ant"),
+    ("/", "buscar"),
+    ("?", "ayuda"),
+    ("q", "salir"),
+    ("←/→", "±10s"),
+    ("s", "aleatorio"),
+    ("r", "repetir"),
+    ("+/-", "vol"),
+    ("c", "carátula"),
+    ("d", "dispositivos"),
+];
+
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let line = match app.visible_status() {
+        Some(status) => {
+            let style = if status.error {
+                theme::error()
+            } else {
+                theme::strong()
+            };
+            Line::styled(format!(" {}", status.text), style)
+        }
+        None => Line::from_iter(FOOTER_KEYS.iter().flat_map(|(k, v)| theme::key_hint(k, v))),
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_search(f: &mut Frame, app: &App, main: Rect) {
+    let area = Rect {
+        height: 4.min(main.height),
+        ..main
+    };
+    f.render_widget(Clear, area);
+
+    let tabs = SearchKind::ALL.iter().flat_map(|kind| {
+        let style = if *kind == app.search_kind {
+            theme::badge()
+        } else {
+            theme::dim()
+        };
+        [
+            Span::styled(format!(" {} ", kind.label()), style),
+            Span::raw(" "),
+        ]
+    });
+    let lines = vec![
+        Line::from_iter(std::iter::once(Span::raw(" ")).chain(tabs)),
+        Line::from(vec![
+            Span::styled(" › ", theme::strong()),
+            Span::styled(app.search_input.clone(), theme::text()),
+            Span::styled("█", theme::text()),
+        ]),
+    ];
+    let block = theme::popup("Buscar", "Tab: tipo · Enter: buscar · Esc: cerrar");
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_devices(f: &mut Frame, app: &mut App) {
     let Popup::Devices { devices, state } = &mut app.popup else {
         return;
     };
     let area = centered(f.area(), 56, 12);
     f.render_widget(Clear, area);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(GREEN))
-        .title(" Dispositivos ")
-        .title_bottom(Line::from(" Enter: reproducir aquí · Esc: cerrar ").right_aligned());
+    let block = theme::popup("Dispositivos", "Enter: reproducir aquí · Esc: cerrar");
 
     match devices {
-        None => f.render_widget(Paragraph::new(" Buscando dispositivos…").block(block), area),
+        None => f.render_widget(
+            Paragraph::new(" Buscando dispositivos…")
+                .style(theme::soft())
+                .block(block),
+            area,
+        ),
         Some(list) if list.is_empty() => f.render_widget(
             Paragraph::new(
                 " No se encontró ningún dispositivo.\n\n Abre la app de Spotify en tu móvil, \
                  ordenador o altavoz y vuelve a pulsar 'd'.",
             )
+            .style(theme::soft())
             .wrap(Wrap { trim: false })
             .block(block),
             area,
@@ -506,66 +529,64 @@ fn draw_devices(f: &mut Frame, app: &mut App) {
                 .iter()
                 .map(|d| {
                     let mut spans = vec![
-                        Span::raw(d.name.clone()),
-                        Span::styled(format!("  ({})", d.kind), Style::new().fg(DIM)),
+                        Span::styled(d.name.clone(), theme::text()),
+                        Span::styled(format!("  ({})", d.kind), theme::dim()),
                     ];
                     if d.active {
-                        spans.push(Span::styled("  ● activo", Style::new().fg(GREEN)));
+                        spans.push(Span::styled("  ● activo", theme::strong()));
                     }
                     ListItem::new(Line::from(spans))
                 })
                 .collect();
             let list = List::new(items)
                 .block(block)
-                .highlight_style(Style::new().bg(SELECT_BG).bold())
+                .highlight_style(theme::selected())
                 .highlight_symbol("▌");
             f.render_stateful_widget(list, area, state);
         }
     }
 }
 
+/// Filas de la ayuda: un título de sección se marca con descripción vacía.
+const HELP_ROWS: [(&str, &str); 19] = [
+    ("Reproducción", ""),
+    ("espacio", "Reproducir / pausar"),
+    ("n · p", "Canción siguiente · anterior"),
+    ("← · →", "Retroceder · adelantar 10 segundos"),
+    ("+ · -", "Subir · bajar volumen"),
+    ("s", "Activar / desactivar aleatorio"),
+    ("r", "Repetir: no → lista → canción"),
+    ("d", "Elegir dispositivo de reproducción"),
+    ("", ""),
+    ("Navegación", ""),
+    ("Tab", "Cambiar entre biblioteca y lista"),
+    ("↑ ↓ · j k", "Moverse · PgUp/PgDn · g/G inicio/fin"),
+    ("Enter", "Abrir lista / reproducir selección"),
+    ("a", "Añadir canción a la cola"),
+    ("o", "Abrir álbum o playlist de la búsqueda"),
+    ("/", "Buscar (Tab cambia: canciones, álbumes…)"),
+    ("c", "Ver la carátula en grande"),
+    ("R · F5", "Actualizar"),
+    ("q · Ctrl+C", "Salir"),
+];
+
 fn draw_help(f: &mut Frame) {
-    let area = centered(f.area(), 62, 26);
+    let area = centered(f.area(), 62, HELP_ROWS.len() as u16 + 2);
     f.render_widget(Clear, area);
-    let rows: &[(&str, &str)] = &[
-        ("Reproducción", ""),
-        ("espacio", "Reproducir / pausar"),
-        ("n · p", "Canción siguiente · anterior"),
-        ("← · →", "Retroceder · adelantar 10 segundos"),
-        ("+ · -", "Subir · bajar volumen"),
-        ("s", "Activar / desactivar aleatorio"),
-        ("r", "Repetir: no → lista → canción"),
-        ("d", "Elegir dispositivo de reproducción"),
-        ("", ""),
-        ("Navegación", ""),
-        ("Tab", "Cambiar entre biblioteca y lista"),
-        ("↑ ↓ · j k", "Moverse · PgUp/PgDn · g/G inicio/fin"),
-        ("Enter", "Abrir lista / reproducir selección"),
-        ("a", "Añadir canción a la cola"),
-        ("o", "Abrir álbum o playlist de la búsqueda"),
-        ("/", "Buscar (Tab cambia: canciones, álbumes…)"),
-        ("c", "Ver la carátula en grande"),
-        ("R · F5", "Actualizar"),
-        ("q · Ctrl+C", "Salir"),
-    ];
-    let lines: Vec<Line> = rows
+    let lines: Vec<Line> = HELP_ROWS
         .iter()
-        .map(|(k, v)| {
-            if v.is_empty() {
-                Line::from(Span::styled(format!(" {k}"), Style::new().fg(GREEN).bold()))
+        .map(|(key, action)| {
+            if action.is_empty() {
+                Line::styled(format!(" {key}"), theme::strong())
             } else {
                 Line::from(vec![
-                    Span::styled(format!("   {k:<12}"), Style::new().fg(Color::White).bold()),
-                    Span::styled(v.to_string(), Style::new().fg(Color::Gray)),
+                    Span::styled(format!("   {key:<12}"), theme::text()),
+                    Span::styled(action.to_string(), theme::soft()),
                 ])
             }
         })
         .collect();
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(GREEN))
-        .title(" Ayuda ")
-        .title_bottom(Line::from(" Pulsa cualquier tecla para cerrar ").right_aligned());
+    let block = theme::popup("Ayuda", "Pulsa cualquier tecla para cerrar");
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

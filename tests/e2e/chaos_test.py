@@ -1,11 +1,12 @@
 """Caos: la API falla al azar y la app recibe miles de teclas. No debe caerse."""
-import datetime, fcntl, json, os, pty, random, select, signal, socket, struct, subprocess, sys, tempfile, termios, time
+import atexit, datetime, fcntl, json, os, pty, random, select, signal, socket, struct, subprocess, sys, tempfile, termios, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = sys.argv[1]; SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 60
 SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 work = tempfile.mkdtemp(prefix="spotify_cmd_e2e_"); log = f"{work}/requests.log"; open(log, "w").close()
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-mock = subprocess.Popen([sys.executable, "-I", HERE + "/mock_spotify.py", str(port), log, "chaos"])
+mock = subprocess.Popen([sys.executable, "-I", HERE + "/mock_spotify.py", str(port), log, "chaos"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+atexit.register(mock.terminate)
 time.sleep(0.5)
 os.makedirs(f"{work}/spotify_cmd")
 open(f"{work}/spotify_cmd/config.toml", "w").write('client_id = "dummy"\npoll_secs = 1\n')

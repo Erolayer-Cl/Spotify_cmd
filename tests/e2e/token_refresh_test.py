@@ -1,6 +1,6 @@
 """El token caduca con la app abierta: debe renovarse solo y seguir funcionando.
 Si Spotify rechaza la renovación, la app avisa pero no se cae."""
-import datetime, fcntl, json, os, pty, select, socket, struct, subprocess, sys, tempfile, termios, time
+import atexit, datetime, fcntl, json, os, pty, select, socket, struct, subprocess, sys, tempfile, termios, time
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE + "/pylib")
 import pyte
 BIN = sys.argv[1]
@@ -11,7 +11,8 @@ def check(name, cond):
 def run(mode):
     work = tempfile.mkdtemp(prefix="spotify_cmd_e2e_"); log = f"{work}/requests.log"; open(log, "w").close()
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-    mock = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log, mode]); time.sleep(0.5)
+    mock = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(0.5)
+    atexit.register(mock.terminate)
     os.makedirs(f"{work}/spotify_cmd")
     open(f"{work}/spotify_cmd/config.toml", "w").write('client_id = "dummy"\npoll_secs = 1\n')
     scopes = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "

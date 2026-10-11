@@ -15,7 +15,7 @@ futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots"] }
 rspotify = { version = "0.16", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

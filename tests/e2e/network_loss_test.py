@@ -1,6 +1,6 @@
 """La red se cae a mitad de la sesión y vuelve: la app no debe caerse y debe
 recuperarse sola, sin reiniciarla."""
-import datetime, fcntl, json, os, pty, select, socket, struct, subprocess, sys, tempfile, termios, time
+import atexit, datetime, fcntl, json, os, pty, select, socket, struct, subprocess, sys, tempfile, termios, time
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE + "/pylib")
 import pyte
 
@@ -9,7 +9,8 @@ work = tempfile.mkdtemp(prefix="spotify_cmd_e2e_")
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
 
 def start_mock(log):
-    m = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log])
+    m = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(m.terminate)
     time.sleep(0.5)
     return m
 

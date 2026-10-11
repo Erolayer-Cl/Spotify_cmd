@@ -1,11 +1,12 @@
 """Prueba de resistencia: uso continuo durante varios minutos midiendo la
 memoria. Si hubiera una fuga, la memoria crecería sin parar."""
-import datetime, fcntl, json, os, pty, random, select, socket, struct, subprocess, sys, tempfile, termios, time
+import atexit, datetime, fcntl, json, os, pty, random, select, socket, struct, subprocess, sys, tempfile, termios, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 BIN = sys.argv[1]; MINUTES = float(sys.argv[2]) if len(sys.argv) > 2 else 4
 work = tempfile.mkdtemp(prefix="spotify_cmd_e2e_"); log = f"{work}/requests.log"; open(log, "w").close()
 s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
-mock = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log]); time.sleep(0.5)
+mock = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(0.5)
+atexit.register(mock.terminate)
 os.makedirs(f"{work}/spotify_cmd")
 open(f"{work}/spotify_cmd/config.toml", "w").write('client_id = "dummy"\npoll_secs = 1\n')
 scopes = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "

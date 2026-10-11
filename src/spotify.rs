@@ -1141,3 +1141,21 @@ mod real_api {
         );
     }
 }
+
+#[cfg(test)]
+mod tls {
+    /// El cliente HTTP confía también en los certificados del sistema, así que
+    /// funciona detrás de proxies corporativos que reemplazan el certificado.
+    /// Necesita red (se ejecuta a mano): `cargo test -- --ignored tls`.
+    #[tokio::test]
+    #[ignore]
+    async fn https_works_behind_intercepting_proxy() {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://index.crates.io/config.json")
+            .send()
+            .await
+            .expect("la conexión TLS debe funcionar");
+        assert!(resp.status().is_success());
+    }
+}

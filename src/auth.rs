@@ -41,8 +41,10 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         ),
         ..Default::default()
     };
-    let mut spotify =
-        AuthCodePkceSpotify::with_config(creds, oauth, client_config(config::token_path()?));
+    let token_path = config::token_path()?;
+    // Temporales que dejó una escritura del token cortada en otra ejecución.
+    config::remove_orphan_temps(&token_path);
+    let mut spotify = AuthCodePkceSpotify::with_config(creds, oauth, client_config(token_path));
 
     // 1. Token guardado de una sesión anterior.
     if let Some(token) = config::load_token(&spotify.config.cache_path, &spotify.oauth.scopes) {

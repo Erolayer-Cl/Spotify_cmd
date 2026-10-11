@@ -82,13 +82,7 @@ fn parse_args() -> Result<Option<Args>> {
             "--manual-auth" => args.manual_auth = true,
             "--halfblocks" => args.halfblocks = true,
             "--logout" => {
-                let path = config::token_path()?;
-                if path.exists() {
-                    std::fs::remove_file(&path)?;
-                    say!("Sesión cerrada (token borrado: {}).", path.display());
-                } else {
-                    say!("No había ninguna sesión guardada.");
-                }
+                logout()?;
                 return Ok(None);
             }
             "-h" | "--help" => {
@@ -106,14 +100,36 @@ fn parse_args() -> Result<Option<Args>> {
     Ok(Some(args))
 }
 
+/// Borra el token guardado y sus temporales (`--logout`).
+fn logout() -> Result<()> {
+    let path = config::token_path()?;
+    if config::delete_session(&path)? {
+        say!("Sesión cerrada (token borrado: {}).", path.display());
+    } else {
+        say!("No había ninguna sesión guardada.");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let result = try_main().await;
     // Pase lo que pase, la terminal vuelve a su estado normal.
     terminal::restore();
-    if let Err(e) = result {
-        say_err!("Error: {e:#}");
-        std::process::exit(1);
+    // Se termina aquí, sin volver de `main`: al destruir el runtime, tokio
+    // esperaría sin límite a los hilos de `spawn_blocking` (un guardado
+    // colgado en un disco de red) y el tope de `RENEWAL_GRACE` no serviría.
+    std::process::exit(exit_code(result));
+}
+
+/// Código de salida del programa. Si hubo un error, lo muestra.
+fn exit_code(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            say_err!("Error: {e:#}");
+            1
+        }
     }
 }
 
@@ -142,16 +158,52 @@ async fn try_main() -> Result<()> {
 
     let mut tui = tui;
     let result = run(&mut tui, spotify, picker, cfg.poll_secs).await;
-    // Una renovación del token en curso (y su guardado) termina antes de
-    // destruir el runtime: cortada a medias, dejaría en disco un refresh
-    // token ya gastado y habría que volver a entrar en el navegador.
-    spotify::wait_for_renewal(RENEWAL_GRACE).await;
+    // La terminal se devuelve antes de esperar a la renovación: si tarda (sin
+    // red), el usuario ve su consola y un aviso, no una app congelada.
     close_terminal(tui);
+    terminal::restore();
+    finish_renewal().await;
     result
 }
 
 /// Tiempo máximo que se espera, al salir, a una renovación del token en curso.
 const RENEWAL_GRACE: Duration = Duration::from_secs(5);
+/// Si al salir la espera a la renovación pasa de este tiempo, se avisa.
+const RENEWAL_NOTICE: Duration = Duration::from_millis(300);
+
+/// Una renovación del token en curso (y su guardado) termina antes de salir:
+/// cortada a medias, dejaría en disco un refresh token ya gastado y habría
+/// que volver a entrar en el navegador. La espera tiene tope y, si se nota,
+/// se avisa de qué se está esperando.
+async fn finish_renewal() {
+    wait_with_notice(
+        spotify::wait_for_renewal,
+        RENEWAL_GRACE,
+        RENEWAL_NOTICE,
+        || say!("Guardando la sesión…"),
+    )
+    .await;
+}
+
+/// Espera con `wait` (que recibe el tope y devuelve si terminó a tiempo)
+/// como mucho `max` en total. Si a los `notice_after` aún no ha terminado,
+/// llama a `notice` una vez y sigue esperando el resto. Devuelve si terminó.
+async fn wait_with_notice<Fut>(
+    wait: impl Fn(Duration) -> Fut,
+    max: Duration,
+    notice_after: Duration,
+    notice: impl FnOnce(),
+) -> bool
+where
+    Fut: Future<Output = bool>,
+{
+    let first = notice_after.min(max);
+    if wait(first).await {
+        return true;
+    }
+    notice();
+    wait(max.saturating_sub(first)).await
+}
 
 /// Devuelve el cursor y suelta la terminal. Si la terminal ya no existe (se
 /// cerró la ventana), se evita el `Drop` de ratatui, que intentaría escribir
@@ -349,18 +401,99 @@ mod tests {
         assert!(app.cover.protocol_type().is_some());
     }
 
-    /// Si la carátula cambia mientras se redimensiona la anterior, la
-    /// respuesta vieja se ignora y no sustituye a la nueva.
+    /// Generación que lleva la respuesta de un redimensionado.
+    fn generation_of(msg: &Msg) -> u64 {
+        match msg {
+            Msg::Resized { generation, .. } => *generation,
+            _ => panic!("se esperaba Msg::Resized"),
+        }
+    }
+
+    /// Si la carátula cambia mientras se redimensiona la anterior, lo que
+    /// llegue de la vieja (su respuesta, su error o su *panic*) se ignora: la
+    /// nueva sigue redimensionándose, sin gastar su reintento, y su propia
+    /// respuesta se aplica.
     #[tokio::test]
     async fn resize_of_a_replaced_cover_is_ignored() {
         let (mut app, mut requests) = app::tests::test_app();
         app.big_cover = true;
         app.set_cover_image(cover());
         let old = draw_and_resize(&mut app, &mut requests).await;
+        let stale = generation_of(&old);
+
         app.set_cover_image(cover());
-        let fresh = app.cover_generation();
+        let fresh = draw_and_resize(&mut app, &mut requests).await;
+        assert_ne!(generation_of(&fresh), stale);
+        app.on_msg(app::tests::resize_error(stale));
         app.on_msg(old);
-        assert_eq!(app.cover_generation(), fresh);
-        assert!(app.cover.protocol_type().is_some(), "la nueva sigue lista");
+        assert!(app.status.is_none(), "el error viejo no se muestra");
+        // El *panic* se informa (como todos), pero no toca la carátula.
+        app.on_msg(app::tests::crash(CrashOrigin::Resize(stale), "panic viejo"));
+        assert!(
+            app.cover.protocol_type().is_none(),
+            "la nueva sigue redimensionándose"
+        );
+        assert_eq!(app::tests::cover_rebuilds(&app), 0);
+
+        app.on_msg(fresh);
+        assert!(app.cover.protocol_type().is_some(), "la nueva queda lista");
+    }
+
+    #[test]
+    fn exit_code_reports_errors() {
+        assert_eq!(exit_code(Ok(())), 0);
+        assert_eq!(exit_code(Err(anyhow::anyhow!("fallo simulado"))), 1);
+    }
+
+    /// Espera falsa para [`wait_with_notice`]: el trabajo termina a los
+    /// `work` desde ahora.
+    fn fake_wait(
+        work: Duration,
+    ) -> impl Fn(Duration) -> std::pin::Pin<Box<dyn Future<Output = bool>>> {
+        let done_at = tokio::time::Instant::now() + work;
+        move |max| {
+            Box::pin(async move {
+                tokio::time::timeout(max, tokio::time::sleep_until(done_at))
+                    .await
+                    .is_ok()
+            })
+        }
+    }
+
+    /// Una espera corta no avisa de nada.
+    #[tokio::test]
+    async fn quick_exit_wait_has_no_notice() {
+        let wait = fake_wait(Duration::from_millis(10));
+        let mut noticed = false;
+        let max = Duration::from_secs(5);
+        let done = wait_with_notice(wait, max, Duration::from_millis(500), || noticed = true).await;
+        assert!(done && !noticed);
+    }
+
+    /// Si la espera se nota, se avisa una sola vez y se sigue esperando.
+    #[tokio::test]
+    async fn slow_exit_wait_gives_notice_and_finishes() {
+        let wait = fake_wait(Duration::from_millis(300));
+        let mut notices = 0;
+        let max = Duration::from_secs(5);
+        let done = wait_with_notice(wait, max, Duration::from_millis(50), || notices += 1).await;
+        assert!(done);
+        assert_eq!(notices, 1);
+    }
+
+    /// Con el trabajo colgado, la espera total no pasa del tope.
+    #[tokio::test]
+    async fn hung_exit_wait_is_bounded_overall() {
+        let wait = fake_wait(Duration::from_secs(60));
+        let mut noticed = false;
+        let start = std::time::Instant::now();
+        let max = Duration::from_millis(300);
+        let done = wait_with_notice(wait, max, Duration::from_millis(100), || noticed = true).await;
+        let waited = start.elapsed();
+        assert!(!done && noticed);
+        assert!(
+            waited >= max && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
     }
 }

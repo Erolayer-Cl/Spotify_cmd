@@ -7,6 +7,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -140,6 +141,103 @@ fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(format!(".{}.{n}.tmp", std::process::id()));
     PathBuf::from(name)
+}
+
+/// Antigüedad a partir de la cual un temporal del token se da por abandonado.
+/// Una escritura tarda milisegundos: a los 10 minutos ninguna sigue en curso.
+const ORPHAN_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Borra los temporales del token que dejó una escritura cortada (la app
+/// murió entre crear el temporal y renombrarlo). Contienen un refresh token,
+/// así que no deben acumularse. Solo se borran los abandonados: uno reciente
+/// puede ser de otra instancia que está escribiendo. Se llama al arrancar y
+/// devuelve cuántos se borraron.
+pub fn remove_orphan_temps(path: &Path) -> usize {
+    remove_temps(path, ORPHAN_TEMP_AGE)
+}
+
+/// Cierra la sesión guardada (`--logout`): borra el token y todos sus
+/// temporales, también los recientes. Devuelve si había algo que borrar.
+pub fn delete_session(path: &Path) -> Result<bool> {
+    let temps = remove_temps(path, Duration::ZERO);
+    let token = match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("no se pudo borrar {}", path.display())),
+    };
+    Ok(token || temps > 0)
+}
+
+/// Borra los temporales del token con al menos `min_age` de antigüedad y
+/// devuelve cuántos. Es limpieza: un fallo (permisos, ya no existe) se
+/// ignora.
+fn remove_temps(path: &Path, min_age: Duration) -> usize {
+    let now = SystemTime::now();
+    temp_files(path)
+        .into_iter()
+        .filter(|tmp| age(tmp, now) >= min_age)
+        .filter(|tmp| fs::remove_file(tmp).is_ok())
+        .count()
+}
+
+/// Temporales de [`temp_path`] que hay junto a `path` (solo archivos
+/// normales: un enlace simbólico con ese nombre no lo creó la app).
+fn temp_files(path: &Path) -> Vec<PathBuf> {
+    let Some(token_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(parent_dir(path)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|name| is_temp_name(name, token_name))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Directorio que contiene `path` (`.` si es un nombre suelto).
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Si `name` tiene la forma de los temporales de [`temp_path`] para el token
+/// `token_name`: `<token_name>.<pid>.<n>.tmp`.
+fn is_temp_name(name: &str, token_name: &str) -> bool {
+    let Some(middle) = name
+        .strip_prefix(token_name)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = middle.split('.');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(pid), Some(n), None) if is_number(pid) && is_number(n)
+    )
+}
+
+fn is_number(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Tiempo desde la última modificación de `path`. Si no se puede saber (o
+/// la fecha está en el futuro), cero: se trata como reciente.
+fn age(path: &Path, now: SystemTime) -> Duration {
+    fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .unwrap_or(Duration::ZERO)
 }
 
 /// Crea el primero de `candidates` que no exista. Si todos existen, devuelve
@@ -399,6 +497,108 @@ mod tests {
         }
         assert!(load_token(&path, &HashSet::new()).is_some());
         assert!(leftover_temps(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Crea un temporal de token con `age` de antigüedad.
+    fn temp_with_age(path: &Path, age: Duration) {
+        fs::write(path, "refresh token a medio escribir").unwrap();
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    /// Directorio con un token, un temporal abandonado, uno reciente y
+    /// archivos ajenos que se parecen. Devuelve (token, abandonado, reciente,
+    /// ajenos).
+    fn session_with_temps(name: &str) -> (PathBuf, PathBuf, PathBuf, Vec<PathBuf>) {
+        let dir = temp_dir(name);
+        let path = dir.join("token.json");
+        save_token(&path, &token("x")).unwrap();
+        let old = dir.join("token.json.123.0.tmp");
+        temp_with_age(&old, ORPHAN_TEMP_AGE + Duration::from_secs(60));
+        let fresh = temp_path(&path);
+        temp_with_age(&fresh, Duration::ZERO);
+        let others: Vec<_> = [
+            "token.json.bak",
+            "otro.tmp",
+            "token.json.a.0.tmp",
+            "config.toml",
+        ]
+        .iter()
+        .map(|n| dir.join(n))
+        .collect();
+        for other in &others {
+            temp_with_age(other, ORPHAN_TEMP_AGE * 2);
+        }
+        (path, old, fresh, others)
+    }
+
+    /// Al arrancar se borran los temporales abandonados (llevan un refresh
+    /// token), pero no uno reciente, que puede ser de otra instancia que está
+    /// escribiendo, ni archivos ajenos.
+    #[test]
+    fn orphan_temps_are_removed_at_startup() {
+        let (path, old, fresh, others) = session_with_temps("orphans");
+        assert_eq!(remove_orphan_temps(&path), 1);
+        assert!(!old.exists());
+        assert!(fresh.exists(), "puede ser de una escritura en curso");
+        assert!(path.exists() && others.iter().all(|o| o.exists()));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `--logout` borra el token y todos sus temporales, también los
+    /// recientes; los archivos ajenos se quedan.
+    #[test]
+    fn logout_deletes_the_token_and_every_temp() {
+        let (path, old, fresh, others) = session_with_temps("logout");
+        assert!(delete_session(&path).unwrap());
+        assert!(!path.exists() && !old.exists() && !fresh.exists());
+        assert!(others.iter().all(|o| o.exists()));
+        assert!(!delete_session(&path).unwrap(), "ya no queda nada");
+
+        // Sin token, un temporal suelto también es una sesión que borrar.
+        temp_with_age(&fresh, Duration::ZERO);
+        assert!(delete_session(&path).unwrap());
+        assert!(!fresh.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Solo cuentan como temporales los nombres que genera [`temp_path`].
+    #[test]
+    fn temp_names_are_recognized() {
+        let path = Path::new("/config/token.json");
+        let ours = temp_path(path);
+        let name = ours.file_name().unwrap().to_str().unwrap();
+        assert!(is_temp_name(name, "token.json"));
+        assert!(is_temp_name("token.json.1.22.tmp", "token.json"));
+        for other in [
+            "token.json",
+            "token.json.tmp",
+            "token.json.1.tmp",
+            "token.json.1.2.3.tmp",
+            "token.json.x.2.tmp",
+            "token.json..2.tmp",
+            "token.json.1.2.tmp.bak",
+            "otro.json.1.2.tmp",
+            "token.jsonX1.2.tmp",
+        ] {
+            assert!(!is_temp_name(other, "token.json"), "{other}");
+        }
+    }
+
+    /// Un enlace simbólico con nombre de temporal no se borra: no lo creó la
+    /// app.
+    #[cfg(unix)]
+    #[test]
+    fn temp_cleanup_ignores_symlinks() {
+        let dir = temp_dir("temp_symlink");
+        let path = dir.join("token.json");
+        let target = dir.join("destino");
+        fs::write(&target, "ajeno").unwrap();
+        let link = dir.join("token.json.1.2.tmp");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(remove_temps(&path, Duration::ZERO), 0);
+        assert!(link.symlink_metadata().is_ok() && target.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

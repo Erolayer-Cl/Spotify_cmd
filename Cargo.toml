@@ -1,0 +1,27 @@
+[package]
+name = "spotify_cmd"
+version = "0.1.0"
+edition = "2024"
+description = "Cliente de Spotify para la terminal: reproducción, listas, buscador y carátula del álbum"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false }
+crossterm = { version = "0.29", features = ["event-stream"] }
+dirs = "7"
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+ratatui = "0.30"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rspotify = { version = "0.16", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+toml = "1"
+webbrowser = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

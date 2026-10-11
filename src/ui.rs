@@ -21,6 +21,8 @@ use crate::theme;
 
 /// Alto del panel "Reproduciendo" (borde incluido).
 const PLAYER_HEIGHT: u16 = 11;
+/// Tamaño máximo de la carátula grande (en filas; el ancho es el doble).
+const MAX_COVER_ROWS: u16 = 60;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [body, player, footer] = Layout::vertical([
@@ -446,8 +448,9 @@ fn draw_big_cover(f: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Cuadrado lo más grande posible, centrado.
-    let side = inner.height.min(inner.width / 2);
+    // Cuadrado lo más grande posible, centrado, con tope: en sixel/kitty la
+    // imagen se genera a resolución real (filas × alto de la fuente).
+    let side = inner.height.min(inner.width / 2).min(MAX_COVER_ROWS);
     draw_cover(f, app, centered(inner, side * 2, side));
 }
 

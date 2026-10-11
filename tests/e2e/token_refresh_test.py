@@ -8,7 +8,7 @@ results = []
 def check(name, cond):
     results.append(bool(cond)); print(("  OK   " if cond else "  FALLO") + " " + name)
 
-def run(mode):
+def run(mode, break_cache=False):
     work = tempfile.mkdtemp(prefix="spotify_cmd_e2e_"); log = f"{work}/requests.log"; open(log, "w").close()
     s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
     mock = subprocess.Popen([sys.executable, HERE + "/mock_spotify.py", str(port), log, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); time.sleep(0.5)
@@ -36,7 +36,13 @@ def run(mode):
             if r:
                 try: stream.feed(os.read(fd, 65536))
                 except OSError: return
-    pump(9)
+    if break_cache:
+        # Con la app abierta, el token deja de poder guardarse en disco.
+        pump(1.5)
+        os.remove(f"{work}/spotify_cmd/token.json"); os.mkdir(f"{work}/spotify_cmd/token.json")
+        pump(7.5)
+    else:
+        pump(9)
     for k in ["n", " ", " "]:
         os.write(fd, k.encode()); pump(0.8)
     lines = open(log).read().splitlines()
@@ -44,7 +50,9 @@ def run(mode):
     alive = os.waitpid(pid, os.WNOHANG)[0] == 0
     os.write(fd, b"q"); pump(1)
     _, st = os.waitpid(pid, 0); mock.terminate()
-    return lines, text, alive, os.waitstatus_to_exitcode(st), json.load(open(f"{work}/spotify_cmd/token.json"))
+    token_path = f"{work}/spotify_cmd/token.json"
+    token = json.load(open(token_path)) if os.path.isfile(token_path) else {}
+    return lines, text, alive, os.waitstatus_to_exitcode(st), token
 
 print("== Renovación correcta")
 lines, text, alive, code, token = run("normal")
@@ -65,5 +73,13 @@ check("no insiste: como mucho 2 intentos en ~12 s (espera entre reintentos)", at
 check("explica que hay que volver a iniciar sesión", "--logout" in text)
 check("la app sigue viva y avisa", alive)
 check("sale con código 0", code == 0)
+print("== No se puede guardar el token en disco")
+lines, text, alive, code, _ = run("normal", break_cache=True)
+refreshes = [l for l in lines if l.startswith("POST /api/token")]
+after = lines[lines.index(refreshes[0]) + 1:] if refreshes else []
+check("renovó el token", len(refreshes) == 1)
+check("sigue usando el token nuevo (en memoria)", after and all("Bearer renovado" in l for l in after if l.startswith(("GET /v1", "POST /v1", "PUT /v1"))))
+check("no muestra un falso 'sesión caducada'", "caducó" not in text)
+check("sale con código 0", alive and code == 0)
 print(f"{sum(results)}/{len(results)} comprobaciones correctas")
 sys.exit(0 if all(results) else 1)

@@ -18,7 +18,22 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend, layout::Rect};
+use ratatui::{
+    DefaultTerminal, Terminal, TerminalOptions, Viewport,
+    backend::{Backend, CrosstermBackend},
+    layout::{Rect, Size},
+};
+
+/// Tope del área de dibujo. ratatui reserva memoria por celda: sin tope, una
+/// ventana absurda (p. ej. 6000×6000, que un pty permite) consumiría GB y el
+/// sistema mataría la app. 1000×500 supera de sobra cualquier monitor real.
+pub const MAX_COLS: u16 = 1000;
+pub const MAX_ROWS: u16 = 500;
+
+/// Área de dibujo para un tamaño de ventana dado, con el tope aplicado.
+pub fn capped_area(size: Size) -> Rect {
+    Rect::new(0, 0, size.width.min(MAX_COLS), size.height.min(MAX_ROWS))
+}
 
 /// `true` mientras la terminal está en modo pantalla completa.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -47,7 +62,27 @@ pub fn init() -> io::Result<DefaultTerminal> {
         restore();
         return Err(e);
     }
-    Terminal::new(CrosstermBackend::new(stdout())).inspect_err(|_| restore())
+    let backend = CrosstermBackend::new(stdout());
+    let area = capped_area(backend.size().inspect_err(|_| restore())?);
+    // Ventana fija: el tamaño lo ajusta `fit_to_window`, siempre con tope.
+    Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(area),
+        },
+    )
+    .inspect_err(|_| restore())
+}
+
+/// Ajusta el área de dibujo al tamaño actual de la ventana (con tope). Hace el
+/// papel de `autoresize`, que ratatui no aplica a ventanas fijas.
+pub fn fit_to_window(tui: &mut DefaultTerminal, current: &mut Rect) -> io::Result<()> {
+    let area = capped_area(tui.size()?);
+    if area != *current {
+        tui.resize(area)?;
+        *current = area;
+    }
+    Ok(())
 }
 
 /// Borra la pantalla y obliga a redibujarla entera en el siguiente frame.
@@ -56,8 +91,8 @@ pub fn init() -> io::Result<DefaultTerminal> {
 /// del cursor: algunas terminales (o un SSH lento) no responden a tiempo y eso
 /// haría fallar la aplicación.
 pub fn full_redraw(tui: &mut DefaultTerminal) -> io::Result<()> {
-    let size = tui.size()?;
-    tui.resize(Rect::new(0, 0, size.width, size.height))
+    let area = capped_area(tui.size()?);
+    tui.resize(area)
 }
 
 /// Deja la terminal como estaba. Se puede llamar varias veces sin problema, y

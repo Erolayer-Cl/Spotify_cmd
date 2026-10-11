@@ -166,9 +166,9 @@ async fn run(
     picker: Picker,
     poll_secs: u64,
 ) -> Result<()> {
-    // Pantalla limpia desde el primer frame (también en terminales sin
-    // pantalla alternativa, donde quedaría el texto anterior).
-    let _ = terminal::full_redraw(tui);
+    // Área de dibujo actual; `fit_to_window` la ajusta (y limpia la pantalla,
+    // también en terminales sin pantalla alternativa) en cada vuelta.
+    let mut area = ratatui::layout::Rect::default();
     let (resize_tx, mut resize_rx) = unbounded_channel();
     let mut app = App::new(spotify, picker, resize_tx, poll_secs);
     let msg_tx = app.sender();
@@ -186,6 +186,9 @@ async fn run(
     let mut draw_failures = 0;
 
     while !app.should_quit {
+        // 0. Seguir el tamaño de la ventana, con tope de memoria.
+        let _ = terminal::fit_to_window(tui, &mut area);
+
         // 1. Dibujar. Un fallo al dibujar no tumba la aplicación.
         match terminal::guard(|| tui.draw(|f| ui::draw(f, &mut app)).map(drop)) {
             Ok(result) => {

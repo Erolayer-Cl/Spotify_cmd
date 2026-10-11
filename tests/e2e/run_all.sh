@@ -17,3 +17,7 @@ echo "== Velocidad (biblioteca de 5000 canciones, 80 ms de latencia)"
 python3 tests/e2e/speed_test.py "$BIN"
 echo "== Resistencia (uso continuo midiendo la memoria, 3 min)"
 python3 tests/e2e/soak_test.py "$BIN" 3
+echo "== Redimensionar la ventana"
+python3 tests/e2e/resize_test.py "$BIN"
+echo "== Ventana gigante (65535×65535): memoria acotada"
+python3 tests/e2e/huge_terminal_test.py "$BIN"

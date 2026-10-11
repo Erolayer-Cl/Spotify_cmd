@@ -758,6 +758,13 @@ fn uri_window(len: usize, start: usize, max: usize) -> (usize, usize) {
     (from, (from + max).min(len))
 }
 
+async fn token_is_valid(sp: &Client) -> bool {
+    match sp.token.lock().await {
+        Ok(token) => token.as_ref().is_some_and(|t| !t.is_expired()),
+        Err(_) => false,
+    }
+}
+
 /// Espera tras un rechazo de Spotify al renovar la sesión.
 const REFRESH_RETRY_REJECTED: Duration = Duration::from_secs(30);
 /// Espera tras un fallo de red al renovar la sesión.
@@ -792,6 +799,12 @@ pub async fn ensure_token(sp: &Client) -> Result<()> {
     }
     match sp.refresh_token().await {
         Ok(()) => {
+            *retry = None;
+            Ok(())
+        }
+        // El token se renovó en memoria pero no se pudo guardar en disco (disco
+        // lleno, permisos): la app sigue funcionando con normalidad.
+        Err(_) if token_is_valid(sp).await => {
             *retry = None;
             Ok(())
         }

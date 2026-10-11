@@ -18,7 +18,7 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 rspotify = { version = "0.16", default-features = false, features = ["client-reqwest", "reqwest-rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "signal"] }
 toml = "1"
 webbrowser = "1"
 

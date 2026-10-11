@@ -1,10 +1,6 @@
 //! Configuración persistente: `~/.config/spotify_cmd/config.toml`.
 
-use std::{
-    fs,
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::{fs, io, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -69,7 +65,7 @@ impl Config {
         } else {
             let config = Self::ask_interactively()?;
             config.save()?;
-            println!(
+            say!(
                 "{}\n",
                 logo::green(&format!("Configuración guardada en {}", path.display()))
             );
@@ -100,14 +96,13 @@ impl Config {
     }
 
     fn ask_interactively() -> Result<Self> {
-        println!("{}\n", logo::green("=== Configuración inicial ==="));
-        println!("Necesitas una app de Spotify (gratis) para conectar esta herramienta:");
-        println!("  1. Entra en https://developer.spotify.com/dashboard y pulsa \"Create app\".");
-        println!("  2. En \"Redirect URIs\" añade exactamente: {DEFAULT_REDIRECT_URI}");
-        println!("  3. Marca \"Web API\" y guarda.");
-        println!("  4. Copia el \"Client ID\" de la app y pégalo aquí.\n");
-        print!("Client ID: ");
-        io::stdout().flush()?;
+        say!("{}\n", logo::green("=== Configuración inicial ==="));
+        say!("Necesitas una app de Spotify (gratis) para conectar esta herramienta:");
+        say!("  1. Entra en https://developer.spotify.com/dashboard y pulsa \"Create app\".");
+        say!("  2. En \"Redirect URIs\" añade exactamente: {DEFAULT_REDIRECT_URI}");
+        say!("  3. Marca \"Web API\" y guarda.");
+        say!("  4. Copia el \"Client ID\" de la app y pégalo aquí.\n");
+        say_inline!("Client ID: ");
         let mut id = String::new();
         io::stdin().read_line(&mut id)?;
         let id = id.trim().to_string();

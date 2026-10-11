@@ -4,16 +4,17 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use rspotify::{
     AuthCodePkceSpotify, ClientError,
     http::HttpError,
     model::{
-        AdditionalType, AlbumId, FullTrack, Image, Market, Offset, PlayableItem, PlaylistId,
+        AdditionalType, AlbumId, FullTrack, Image, Market, Offset, Page, PlayableItem, PlaylistId,
         RepeatState, SearchResult, SearchType, SimplifiedPlaylist,
     },
     prelude::*,
 };
+use std::future::Future;
 
 pub type Client = AuthCodePkceSpotify;
 
@@ -223,6 +224,12 @@ impl ApiError {
     }
 }
 
+/// `true` si el error es de conexión (sin red, DNS, tiempo agotado), no una
+/// respuesta de Spotify.
+pub fn is_network_error(err: &ClientError) -> bool {
+    matches!(err, ClientError::Http(http) if matches!(http.as_ref(), HttpError::Client(_)))
+}
+
 /// Qué tipo de petición falló: cambia el significado de algunos códigos.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -235,8 +242,22 @@ fn friendly(err: ClientError, kind: Kind) -> anyhow::Error {
     let ClientError::Http(http) = &err else {
         return anyhow!("{err}");
     };
-    let HttpError::StatusCode(resp) = http.as_ref() else {
-        return anyhow!("sin conexión con Spotify ({err})");
+    let resp = match http.as_ref() {
+        HttpError::StatusCode(resp) => resp,
+        HttpError::Client(e) => {
+            let message = if e.is_timeout() {
+                "Spotify no respondió a tiempo; se reintentará"
+            } else {
+                "sin conexión con Spotify: revisa tu red (se reintentará solo)"
+            };
+            return anyhow::Error::new(ApiError {
+                status: None,
+                retry_after: None,
+                message: message.into(),
+            });
+        }
+        #[allow(unreachable_patterns)]
+        _ => return anyhow!("error de red: {err}"),
     };
     let status = resp.status().as_u16();
     let retry_after = resp
@@ -356,18 +377,63 @@ pub async fn playback(sp: &Client) -> Result<Option<Playback>> {
     }))
 }
 
+/// Elementos por página (el máximo que acepta Spotify en estas rutas).
+const PAGE_SIZE: u32 = 50;
+/// Páginas que se piden a la vez.
+const PARALLEL_PAGES: usize = 4;
+/// Límites para que las bibliotecas enormes carguen rápido.
+const MAX_PLAYLISTS: u32 = 500;
+const MAX_PLAYLIST_TRACKS: u32 = 2000;
+const MAX_SAVED_TRACKS: u32 = 1000;
+
+/// Descarga una lista paginada: primero la página 0 (que trae el total) y
+/// después el resto en paralelo, conservando el orden. Mucho más rápido que
+/// pedirlas una detrás de otra.
+async fn fetch_paged<T, F, Fut>(max_items: u32, fetch_page: F) -> Result<Vec<T>>
+where
+    F: Fn(u32) -> Fut,
+    Fut: Future<Output = Result<Page<T>>>,
+    T: serde::de::DeserializeOwned,
+{
+    let first = fetch_page(0).await?;
+    let wanted = first.total.min(max_items);
+    let mut items = first.items;
+
+    let offsets = (PAGE_SIZE..wanted).step_by(PAGE_SIZE as usize);
+    let rest: Vec<Page<T>> = futures::stream::iter(offsets)
+        .map(fetch_page)
+        .buffered(PARALLEL_PAGES)
+        .try_collect()
+        .await?;
+    items.extend(rest.into_iter().flat_map(|page| page.items));
+    items.truncate(max_items as usize);
+    Ok(items)
+}
+
 pub async fn playlists(sp: &Client) -> Result<Vec<PlaylistEntry>> {
-    let items: Vec<SimplifiedPlaylist> =
-        sp.current_user_playlists().try_collect().await.friendly()?;
+    let items = fetch_paged(MAX_PLAYLISTS, |offset| async move {
+        sp.current_user_playlists_manual(Some(PAGE_SIZE), Some(offset))
+            .await
+            .friendly()
+    })
+    .await?;
     Ok(items.into_iter().map(playlist_entry).collect())
 }
 
 pub async fn playlist_tracks(sp: &Client, id: PlaylistId<'static>) -> Result<Vec<TrackEntry>> {
-    let items: Vec<_> = sp
-        .playlist_items(id, None, Some(Market::FromToken))
-        .try_collect()
+    let id = &id;
+    let items = fetch_paged(MAX_PLAYLIST_TRACKS, |offset| async move {
+        sp.playlist_items_manual(
+            id.as_ref(),
+            None,
+            Some(Market::FromToken),
+            Some(PAGE_SIZE),
+            Some(offset),
+        )
         .await
-        .friendly()?;
+        .friendly()
+    })
+    .await?;
     Ok(items
         .iter()
         .filter_map(|i| i.item.as_ref().and_then(playable_entry))
@@ -396,23 +462,15 @@ pub async fn album_tracks(
         .collect())
 }
 
-/// Canciones guardadas ("Tus me gusta"). Se limitan a las 500 más recientes
-/// para no tardar demasiado con bibliotecas enormes.
+/// Canciones guardadas ("Tus me gusta"), las más recientes primero.
 pub async fn saved_tracks(sp: &Client) -> Result<Vec<TrackEntry>> {
-    let mut out = Vec::new();
-    let mut offset = 0;
-    loop {
-        let page = sp
-            .current_user_saved_tracks_manual(Some(Market::FromToken), Some(50), Some(offset))
+    let items = fetch_paged(MAX_SAVED_TRACKS, |offset| async move {
+        sp.current_user_saved_tracks_manual(Some(Market::FromToken), Some(PAGE_SIZE), Some(offset))
             .await
-            .friendly()?;
-        out.extend(page.items.iter().map(|s| track_entry(&s.track)));
-        offset += page.items.len() as u32;
-        if page.next.is_none() || page.items.is_empty() || out.len() >= 500 {
-            break;
-        }
-    }
-    Ok(out)
+            .friendly()
+    })
+    .await?;
+    Ok(items.iter().map(|s| track_entry(&s.track)).collect())
 }
 
 pub async fn recently_played(sp: &Client) -> Result<Vec<TrackEntry>> {
@@ -511,14 +569,21 @@ pub async fn devices(sp: &Client) -> Result<Vec<DeviceEntry>> {
         .collect())
 }
 
+/// Tamaño máximo aceptado para una carátula (las de Spotify pesan ~50 KB).
+const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
 pub async fn download_image(http: &reqwest::Client, url: &str) -> Result<image::DynamicImage> {
-    let bytes = http
-        .get(url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let response = http.get(url).send().await?.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|len| len as usize > MAX_IMAGE_BYTES)
+    {
+        anyhow::bail!("la imagen es demasiado grande");
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        anyhow::bail!("la imagen es demasiado grande");
+    }
     let img = tokio::task::spawn_blocking(move || image::load_from_memory(&bytes)).await??;
     Ok(img)
 }
@@ -628,13 +693,10 @@ fn uri_window(len: usize, start: usize, max: usize) -> (usize, usize) {
 pub async fn ensure_token(sp: &Client) {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = LOCK.lock().await;
-    let expired = sp
-        .token
-        .lock()
-        .await
-        .unwrap()
-        .as_ref()
-        .is_none_or(|t| t.is_expired());
+    let expired = match sp.token.lock().await {
+        Ok(token) => token.as_ref().is_none_or(|t| t.is_expired()),
+        Err(_) => false,
+    };
     if expired {
         let _ = sp.refresh_token().await;
     }
@@ -643,6 +705,49 @@ pub async fn ensure_token(sp: &Client) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn page(items: Vec<u32>, total: u32) -> Page<u32> {
+        Page {
+            href: String::new(),
+            items,
+            limit: PAGE_SIZE,
+            next: None,
+            offset: 0,
+            previous: None,
+            total,
+        }
+    }
+
+    /// Simula una lista de `total` elementos numerados desde 0.
+    async fn fake_page(offset: u32, total: u32) -> Result<Page<u32>> {
+        let end = (offset + PAGE_SIZE).min(total);
+        Ok(page((offset..end).collect(), total))
+    }
+
+    #[tokio::test]
+    async fn fetch_paged_keeps_order_and_limits() {
+        let all = fetch_paged(1000, |o| fake_page(o, 237)).await.unwrap();
+        assert_eq!(all, (0..237).collect::<Vec<_>>());
+
+        let capped = fetch_paged(120, |o| fake_page(o, 5000)).await.unwrap();
+        assert_eq!(capped, (0..120).collect::<Vec<_>>());
+
+        let empty = fetch_paged(1000, |o| fake_page(o, 0)).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_paged_propagates_errors() {
+        let result = fetch_paged(1000, |o| async move {
+            if o == 100 {
+                anyhow::bail!("fallo en la página 3")
+            } else {
+                fake_page(o, 300).await
+            }
+        })
+        .await;
+        assert!(result.is_err());
+    }
 
     #[test]
     fn uri_window_contains_start_and_fills_up() {

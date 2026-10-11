@@ -3,10 +3,7 @@
 //! Solo hace falta el Client ID (no el secreto). El token se guarda en disco y
 //! se renueva automáticamente, así que el navegador solo se abre la primera vez.
 
-use std::{
-    io::{self, Write},
-    time::Duration,
-};
+use std::{io, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rspotify::{AuthCodePkceSpotify, Credentials, OAuth, prelude::*, scopes};
@@ -17,6 +14,7 @@ use tokio::{
 
 use crate::config::{self, Config};
 use crate::logo;
+use crate::spotify;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -46,13 +44,19 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     // 1. Token guardado de una sesión anterior.
     if let Ok(Some(token)) = spotify.read_token_cache(true).await {
         let expired = token.is_expired();
-        *spotify.token.lock().await.unwrap() = Some(token);
+        if let Ok(mut slot) = spotify.token.lock().await {
+            *slot = Some(token);
+        }
         if !expired {
             return Ok(spotify);
         }
         match spotify.refresh_token().await {
             Ok(()) => return Ok(spotify),
-            Err(e) => eprintln!(
+            // Sin red no tiene sentido abrir el navegador: se avisa y se sale.
+            Err(e) if spotify::is_network_error(&e) => {
+                bail!("no hay conexión con Spotify ({e}). Revisa tu red e inténtalo de nuevo")
+            }
+            Err(e) => say_err!(
                 "No se pudo renovar el token guardado ({e}); hay que iniciar sesión de nuevo."
             ),
         }
@@ -63,8 +67,8 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         .get_authorize_url(None)
         .context("no se pudo generar la URL de autorización")?;
 
-    println!("Inicia sesión en Spotify para autorizar spotify_cmd.\n");
-    println!(
+    say!("Inicia sesión en Spotify para autorizar spotify_cmd.\n");
+    say!(
         "Si el navegador no se abre solo, visita esta URL:\n\n  {}\n",
         logo::green(&url)
     );
@@ -73,15 +77,14 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     let code = match listen_addr {
         Some(addr) if !manual => {
             let _ = webbrowser::open(&url);
-            println!("Esperando la redirección en http://{addr} ... (Ctrl+C para cancelar)");
+            say!("Esperando la redirección en http://{addr} ... (Ctrl+C para cancelar)");
             tokio::time::timeout(AUTH_TIMEOUT, wait_for_code(&spotify, addr))
                 .await
                 .map_err(|_| anyhow!("se agotó el tiempo de espera de la autorización"))??
         }
         _ => {
-            println!("Tras aceptar, el navegador te llevará a una página que puede no cargar.");
-            print!("Copia la URL completa de la barra de direcciones y pégala aquí: ");
-            io::stdout().flush()?;
+            say!("Tras aceptar, el navegador te llevará a una página que puede no cargar.");
+            say_inline!("Copia la URL completa de la barra de direcciones y pégala aquí: ");
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             spotify
@@ -94,7 +97,7 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         .request_token(&code)
         .await
         .context("Spotify rechazó el código de autorización")?;
-    println!("{}", logo::green("¡Sesión iniciada!"));
+    say!("{}", logo::green("¡Sesión iniciada!"));
     Ok(spotify)
 }
 

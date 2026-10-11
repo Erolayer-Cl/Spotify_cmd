@@ -2,11 +2,13 @@
 
 use std::{
     future::Future,
+    panic::AssertUnwindSafe,
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use futures::FutureExt;
 use image::DynamicImage;
 use ratatui::widgets::{ListState, TableState};
 use ratatui_image::{
@@ -23,10 +25,13 @@ use crate::spotify::{
     self, Action, ApiError, Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind,
     SearchResults, TrackEntry,
 };
+use crate::terminal;
 
 const STATUS_TTL: Duration = Duration::from_secs(6);
 const SEEK_STEP_MS: u64 = 10_000;
 const VOLUME_STEP: i32 = 5;
+/// Sin red, el estado se vuelve a consultar cada 10 s en lugar de cada 3 s.
+const OFFLINE_RETRY: Duration = Duration::from_secs(10);
 
 /// Mensajes que llegan al bucle principal desde las tareas en segundo plano.
 pub enum Msg {
@@ -53,6 +58,36 @@ pub enum Msg {
         result: Result<DynamicImage>,
     },
     Resized(std::result::Result<ResizeResponse, Errors>),
+    /// Una tarea en segundo plano falló de forma inesperada (*panic*). La
+    /// aplicación lo muestra y sigue funcionando.
+    Crashed(String),
+}
+
+/// Lanza una tarea que siempre responde con un mensaje: si la tarea sufre un
+/// *panic*, se envía [`Msg::Crashed`] en lugar de perder la respuesta.
+pub fn spawn_guarded<Fut>(tx: UnboundedSender<Msg>, task: Fut)
+where
+    Fut: Future<Output = Msg> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let msg = match AssertUnwindSafe(task).catch_unwind().await {
+            Ok(msg) => msg,
+            Err(payload) => Msg::Crashed(terminal::panic_message(payload)),
+        };
+        let _ = tx.send(msg);
+    });
+}
+
+/// Igual que [`spawn_guarded`] pero para trabajo pesado de CPU (en otro hilo).
+pub fn spawn_blocking_guarded<F>(tx: UnboundedSender<Msg>, work: F)
+where
+    F: FnOnce() -> Msg + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let msg = std::panic::catch_unwind(AssertUnwindSafe(work))
+            .unwrap_or_else(|payload| Msg::Crashed(terminal::panic_message(payload)));
+        let _ = tx.send(msg);
+    });
 }
 
 /// Entradas fijas de la barra lateral, seguidas de las playlists del usuario.
@@ -128,7 +163,8 @@ pub struct App {
 
     pub playback: Option<Playback>,
     playback_inflight: bool,
-    last_poll: Instant,
+    /// Última consulta del estado de reproducción (`None` = nunca).
+    last_poll: Option<Instant>,
     refresh_at: Option<Instant>,
 
     pub playlists: Vec<PlaylistEntry>,
@@ -151,6 +187,36 @@ pub struct App {
     cover_url: Option<String>,
 
     pub status: Option<Status>,
+
+    pending_seek: Debounced<u64>,
+    pending_volume: Debounced<u8>,
+}
+
+/// Espera sin cambios antes de enviar un valor agrupado.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Agrupa cambios rápidos (una tecla mantenida) y entrega solo el último
+/// valor cuando pasan [`DEBOUNCE`] sin cambios nuevos.
+#[derive(Debug, Default)]
+struct Debounced<T> {
+    pending: Option<(T, Instant)>,
+}
+
+impl<T> Debounced<T> {
+    fn set(&mut self, value: T) {
+        self.pending = Some((value, Instant::now()));
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn take_ready(&mut self) -> Option<T> {
+        match &self.pending {
+            Some((_, at)) if at.elapsed() >= DEBOUNCE => self.pending.take().map(|(v, _)| v),
+            _ => None,
+        }
+    }
 }
 
 impl App {
@@ -178,7 +244,7 @@ impl App {
             big_cover: false,
             playback: None,
             playback_inflight: false,
-            last_poll: Instant::now() - Duration::from_secs(3600),
+            last_poll: None,
             refresh_at: None,
             playlists: Vec::new(),
             library_state,
@@ -194,6 +260,8 @@ impl App {
             cover: ThreadProtocol::new(resize_tx, None),
             cover_url: None,
             status: None,
+            pending_seek: Debounced::default(),
+            pending_volume: Debounced::default(),
         }
     }
 
@@ -219,11 +287,14 @@ impl App {
         Fut: Future<Output = Msg> + Send + 'static,
     {
         let sp = self.spotify.clone();
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
+        spawn_guarded(self.tx.clone(), async move {
             spotify::ensure_token(&sp).await;
-            let _ = tx.send(f(sp).await);
+            f(sp).await
         });
+    }
+
+    fn since_last_poll(&self) -> Duration {
+        self.last_poll.map_or(Duration::MAX, |t| t.elapsed())
     }
 
     fn poll_playback(&mut self) {
@@ -231,7 +302,7 @@ impl App {
             return;
         }
         self.playback_inflight = true;
-        self.last_poll = Instant::now();
+        self.last_poll = Some(Instant::now());
         self.spawn(|sp| async move { Msg::Playback(spotify::playback(&sp).await) });
     }
 
@@ -266,17 +337,18 @@ impl App {
         });
     }
 
-    /// Ante un 429, pausa las consultas periódicas el tiempo que pida Spotify.
+    /// Espacia las consultas periódicas cuando Spotify pide calma (429) o
+    /// cuando no hay red, para no saturar ni gastar batería.
     fn note_rate_limit(&mut self, err: &anyhow::Error) {
-        if let Some(api) = err.downcast_ref::<ApiError>()
-            && api.status == Some(429)
-        {
-            let wait = api
-                .retry_after
-                .unwrap_or(Duration::from_secs(5))
-                .min(Duration::from_secs(120));
-            self.backoff_until = Some(Instant::now() + wait);
-        }
+        let Some(api) = err.downcast_ref::<ApiError>() else {
+            return;
+        };
+        let wait = match api.status {
+            Some(429) => api.retry_after.unwrap_or(Duration::from_secs(5)),
+            None => OFFLINE_RETRY,
+            Some(_) => return,
+        };
+        self.backoff_until = Some(Instant::now() + wait.min(Duration::from_secs(120)));
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -520,9 +592,8 @@ impl App {
         };
         pb.progress_ms = target;
         pb.fetched_at = Instant::now();
-        self.do_action(Action::Seek {
-            position_ms: target,
-        });
+        // Se envía al soltar la tecla: mantenerla pulsada no satura la API.
+        self.pending_seek.set(target);
     }
 
     fn change_volume(&mut self, delta: i32) {
@@ -535,7 +606,17 @@ impl App {
         };
         let new = (vol as i32 + delta).clamp(0, 100) as u32;
         pb.volume = Some(new);
-        self.do_action(Action::Volume(new as u8));
+        self.pending_volume.set(new as u8);
+    }
+
+    /// Envía los cambios agrupados de volumen y posición cuando se dejan de pulsar.
+    fn flush_debounced(&mut self) {
+        if let Some(position_ms) = self.pending_seek.take_ready() {
+            self.do_action(Action::Seek { position_ms });
+        }
+        if let Some(volume) = self.pending_volume.take_ready() {
+            self.do_action(Action::Volume(volume));
+        }
     }
 
     fn toggle_shuffle(&mut self) {
@@ -582,11 +663,12 @@ impl App {
     // -----------------------------------------------------------------------
 
     pub fn on_tick(&mut self) {
+        self.flush_debounced();
         let now = Instant::now();
         if self.refresh_at.is_some_and(|at| now >= at) {
             self.refresh_at = None;
             self.poll_playback();
-        } else if self.last_poll.elapsed() >= self.poll_every {
+        } else if self.since_last_poll() >= self.poll_every {
             self.poll_playback();
         }
         // Al terminar la canción, se consulta enseguida la siguiente.
@@ -594,7 +676,7 @@ impl App {
             && pb.is_playing
             && pb.duration_ms > 0
             && pb.current_progress_ms() >= pb.duration_ms
-            && self.last_poll.elapsed() > Duration::from_secs(1)
+            && self.since_last_poll() > Duration::from_secs(1)
         {
             self.poll_playback();
         }
@@ -725,20 +807,58 @@ impl App {
                 }
                 Err(e) => self.set_status(format!("Error al dibujar la carátula: {e}"), true),
             },
+            Msg::Crashed(reason) => self.recover_from_crash(&reason),
         }
     }
 
-    fn set_playback(&mut self, pb: Option<Playback>) {
+    /// Deja el estado coherente tras un fallo inesperado en una tarea.
+    fn recover_from_crash(&mut self, reason: &str) {
+        self.playback_inflight = false;
+        if matches!(self.main, MainContent::Loading(_)) {
+            self.pending_list = None;
+            self.main =
+                MainContent::Message(format!("No se pudo completar la operación: {reason}"));
+        }
+        if matches!(self.popup, Popup::Devices { devices: None, .. }) {
+            self.popup = Popup::None;
+        }
+        self.set_status(
+            format!("Error interno (la aplicación sigue funcionando): {reason}"),
+            true,
+        );
+    }
+
+    /// Registra un fallo capturado en el bucle principal (al dibujar o al
+    /// procesar un evento).
+    pub fn report_crash(&mut self, reason: &str) {
+        self.recover_from_crash(reason);
+    }
+
+    pub fn show_error(&mut self, text: String) {
+        self.set_status(text, true);
+    }
+
+    fn set_playback(&mut self, mut pb: Option<Playback>) {
+        // Mientras haya un cambio sin enviar, se conserva el valor local para
+        // que la pantalla no "salte" hacia atrás.
+        if let (Some(new), Some(old)) = (pb.as_mut(), self.playback.as_ref()) {
+            if self.pending_seek.is_pending() {
+                new.progress_ms = old.current_progress_ms();
+                new.fetched_at = Instant::now();
+            }
+            if self.pending_volume.is_pending() {
+                new.volume = old.volume;
+            }
+        }
         let new_url = pb.as_ref().and_then(|p| p.cover_url.clone());
         if new_url != self.cover_url {
             self.cover_url = new_url.clone();
             match new_url {
                 Some(url) => {
                     let http = self.http.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
+                    spawn_guarded(self.tx.clone(), async move {
                         let result = spotify::download_image(&http, &url).await;
-                        let _ = tx.send(Msg::Cover { url, result });
+                        Msg::Cover { url, result }
                     });
                 }
                 None => self.cover.empty_protocol(),
@@ -1040,5 +1160,148 @@ pub mod tests {
         assert_eq!(app.library_item(3), Some(LibraryItem::Playlist(0)));
         assert_eq!(app.library_item(4), None);
         assert_eq!(app.library_len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod robustness {
+    use super::tests::test_app;
+    use super::*;
+
+    /// Generador pseudoaleatorio mínimo (reproducible, sin dependencias).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as usize
+        }
+    }
+
+    const KEYS: [KeyCode; 30] = [
+        KeyCode::Char(' '),
+        KeyCode::Char('n'),
+        KeyCode::Char('p'),
+        KeyCode::Char('s'),
+        KeyCode::Char('r'),
+        KeyCode::Char('/'),
+        KeyCode::Char('d'),
+        KeyCode::Char('c'),
+        KeyCode::Char('?'),
+        KeyCode::Char('R'),
+        KeyCode::Char('a'),
+        KeyCode::Char('o'),
+        KeyCode::Char('j'),
+        KeyCode::Char('k'),
+        KeyCode::Char('g'),
+        KeyCode::Char('G'),
+        KeyCode::Char('+'),
+        KeyCode::Char('-'),
+        KeyCode::Char('x'),
+        KeyCode::Char('é'),
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::PageUp,
+        KeyCode::PageDown,
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Enter,
+        KeyCode::Esc,
+    ];
+
+    fn err<T>() -> Result<T> {
+        Err(anyhow::anyhow!("fallo simulado"))
+    }
+
+    fn random_msg(rng: &mut Lcg, app: &App) -> Msg {
+        let request = app.request_id.wrapping_sub((rng.next() % 2) as u64);
+        match rng.next() % 8 {
+            0 => Msg::Playback(Ok(None)),
+            1 => Msg::Playback(err()),
+            2 => Msg::Tracks {
+                request,
+                result: Ok(Vec::new()),
+            },
+            3 => Msg::Tracks {
+                request,
+                result: err(),
+            },
+            4 => Msg::Devices(Ok(Vec::new())),
+            5 => Msg::ActionDone {
+                done: Some("ok"),
+                refresh_queue: true,
+                result: err(),
+            },
+            6 => Msg::Search {
+                request,
+                title: "t".into(),
+                kind: SearchKind::Albums,
+                result: Ok(SearchResults::Contexts(Vec::new())),
+            },
+            _ => Msg::Crashed("panic simulado".into()),
+        }
+    }
+
+    /// Miles de teclas y respuestas aleatorias: nada debe provocar un panic.
+    #[tokio::test]
+    async fn survives_random_keys_and_messages() {
+        let (mut app, _rx) = test_app();
+        let mut rng = Lcg(42);
+        for _ in 0..5_000 {
+            if rng.next().is_multiple_of(3) {
+                let msg = random_msg(&mut rng, &app);
+                app.on_msg(msg);
+            } else {
+                let code = KEYS[rng.next() % KEYS.len()];
+                app.on_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+            }
+            app.on_tick();
+            // No salir: se reabre si alguna tecla pidió cerrar.
+            app.should_quit = false;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_is_reported_not_fatal() {
+        let (tx, mut rx) = unbounded_channel();
+        spawn_guarded(tx.clone(), async {
+            panic!("la API devolvió algo imposible")
+        });
+        match rx.recv().await {
+            Some(Msg::Crashed(reason)) => assert!(reason.contains("imposible")),
+            _ => panic!("se esperaba Msg::Crashed"),
+        }
+        spawn_blocking_guarded(tx, || panic!("fallo al redimensionar"));
+        assert!(matches!(rx.recv().await, Some(Msg::Crashed(_))));
+    }
+
+    #[test]
+    fn debounced_delivers_only_the_last_value() {
+        let mut d = Debounced::default();
+        d.set(10);
+        d.set(15);
+        d.set(20);
+        assert_eq!(d.take_ready(), None, "aún no pasó el tiempo de espera");
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(20));
+        assert_eq!(d.take_ready(), Some(20));
+        assert_eq!(d.take_ready(), None);
+        assert!(!d.is_pending());
+    }
+
+    #[tokio::test]
+    async fn crash_while_loading_leaves_a_usable_screen() {
+        let (mut app, _rx) = test_app();
+        app.main = MainContent::Loading("Cargando…".into());
+        app.playback_inflight = true;
+        app.on_msg(Msg::Crashed("boom".into()));
+        assert!(matches!(app.main, MainContent::Message(_)));
+        assert!(
+            !app.playback_inflight,
+            "las consultas deben poder reanudarse"
+        );
     }
 }

@@ -12,6 +12,7 @@ use ratatui::{
 };
 use ratatui_image::{FilterType, Resize, StatefulImage};
 use rspotify::model::RepeatState;
+use rspotify::prelude::Id;
 
 use crate::app::{App, FIXED_LIBRARY, Focus, LibraryItem, MainContent, Popup, repeat_label};
 use crate::logo::{LOGO_LARGE, LOGO_SMALL};
@@ -140,7 +141,7 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
             LibraryItem::Liked => ("♥", "Tus me gusta"),
             LibraryItem::Recent => ("◷", "Recientes"),
             LibraryItem::Queue => ("≡", "Cola"),
-            LibraryItem::Playlist(_) => unreachable!("FIXED_LIBRARY no contiene playlists"),
+            LibraryItem::Playlist(_) => ("♫", "Playlist"),
         };
         library_line(
             icon,
@@ -195,7 +196,12 @@ fn library_line(
 
 fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = has_focus(app, Focus::Main);
-    let playing_uri = app.playback.as_ref().and_then(|p| p.item_uri.clone());
+    // Id (sin "spotify:track:") de lo que suena, para marcarlo en la lista.
+    let playing_id = app
+        .playback
+        .as_ref()
+        .and_then(|p| p.item_uri.as_deref())
+        .and_then(|uri| uri.rsplit(':').next());
 
     match &app.main {
         MainContent::Loading(text) | MainContent::Message(text) => {
@@ -208,7 +214,7 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             let rows = tracks
                 .iter()
                 .enumerate()
-                .map(|(i, t)| track_row(i, t, playing_uri.is_some() && t.uri() == playing_uri))
+                .map(|(i, t)| track_row(i, t, is_playing(t, playing_id)))
                 .collect();
             let widths = [
                 Constraint::Length(4),
@@ -229,8 +235,8 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|c| {
                     Row::new(vec![
                         Cell::from(icon).style(theme::text()),
-                        Cell::from(c.name.clone()),
-                        Cell::from(c.detail.clone()).style(theme::dim()),
+                        Cell::from(c.name.as_str()),
+                        Cell::from(c.detail.as_str()).style(theme::dim()),
                     ])
                 })
                 .collect();
@@ -251,8 +257,17 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Compara ids sin reservar memoria: se llama para cada fila en cada frame.
+fn is_playing(track: &TrackEntry, playing_id: Option<&str>) -> bool {
+    match (&track.id, playing_id) {
+        (Some(id), Some(playing)) => id.id() == playing,
+        _ => false,
+    }
+}
+
 /// Fila de una canción; la que está sonando se marca con ♪ y en negrita.
-fn track_row(index: usize, track: &TrackEntry, is_playing: bool) -> Row<'static> {
+/// Toma el texto prestado de `track`, sin copiarlo.
+fn track_row(index: usize, track: &TrackEntry, is_playing: bool) -> Row<'_> {
     let number = if is_playing {
         "♪".to_string()
     } else {
@@ -276,9 +291,9 @@ fn track_row(index: usize, track: &TrackEntry, is_playing: bool) -> Row<'static>
         } else {
             theme::dim()
         }),
-        Cell::from(track.name.clone()),
-        Cell::from(track.artists.clone()).style(secondary),
-        Cell::from(track.album.clone()).style(theme::dim()),
+        Cell::from(track.name.as_str()),
+        Cell::from(track.artists.as_str()).style(secondary),
+        Cell::from(track.album.as_str()).style(theme::dim()),
         Cell::from(fmt_ms(track.duration_ms)).style(theme::dim()),
     ])
     .style(base)
@@ -590,6 +605,17 @@ fn draw_help(f: &mut Frame) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// Pantalla mínima si la interfaz normal falla varias veces seguidas.
+pub fn draw_fallback(f: &mut Frame, reason: &str) {
+    let area = f.area();
+    f.render_widget(Clear, area);
+    let message = format!(
+        "La interfaz tuvo un problema al dibujarse:\n{reason}\n\n\
+         Prueba a cambiar el tamaño de la ventana, o pulsa q para salir."
+    );
+    draw_logo_message(f, area, &message);
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -713,5 +739,194 @@ mod tests {
         app.popup = Popup::Help;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert!(buffer_text(&terminal).contains("Ayuda"));
+    }
+}
+
+/// Pruebas de robustez: la interfaz no debe fallar con ningún tamaño de
+/// terminal, estado ni texto, por raro que sea.
+#[cfg(test)]
+mod robustness {
+    use std::time::{Duration, Instant};
+
+    use ratatui::{Terminal, backend::TestBackend};
+    use rspotify::model::{PlayableId, RepeatState, TrackId};
+
+    use super::*;
+    use crate::app::{TrackSource, tests::test_app};
+    use crate::spotify::{ContextEntry, DeviceEntry, Playback, PlaylistEntry, TrackEntry};
+
+    const WEIRD: [&str; 6] = [
+        "",
+        "🎵🔥 Canción con emojis 👨‍👩‍👧‍👦",
+        "東京事変 — 群青日和 (2004) 「テスト」",
+        "مرحبا بالعالم موسيقى",
+        "tab\tnueva\nlínea\u{1b}[31mescape\u{0}nulo",
+        "Nombre larguísimo que no cabe en ninguna columna de ninguna terminal razonable jamás",
+    ];
+
+    fn track(name: &str) -> TrackEntry {
+        TrackEntry {
+            name: name.into(),
+            artists: name.into(),
+            album: name.into(),
+            duration_ms: u64::MAX / 2,
+            id: TrackId::from_id("4u7EnebtmKWzUH433cf5Qv".to_string())
+                .ok()
+                .map(PlayableId::Track),
+        }
+    }
+
+    fn playback(name: &str, progress_ms: u64, duration_ms: u64) -> Playback {
+        Playback {
+            is_playing: progress_ms.is_multiple_of(2),
+            progress_ms,
+            duration_ms,
+            title: name.into(),
+            artists: name.into(),
+            album: name.into(),
+            cover_url: None,
+            item_uri: Some("spotify:track:4u7EnebtmKWzUH433cf5Qv".into()),
+            shuffle: true,
+            repeat: RepeatState::Track,
+            device_name: name.into(),
+            device_type: name.into(),
+            volume: Some(100),
+            fetched_at: Instant::now() - Duration::from_millis(1),
+        }
+    }
+
+    fn all_states(app: &mut App, step: usize) {
+        let name = WEIRD[step % WEIRD.len()];
+        app.playback = match step % 4 {
+            0 => None,
+            1 => Some(playback(name, 0, 0)),
+            2 => Some(playback(name, 10_000_000, 1_000)),
+            _ => Some(playback(name, 61_000, 3_600_000)),
+        };
+        app.playlists = WEIRD
+            .iter()
+            .map(|n| PlaylistEntry {
+                id: rspotify::model::PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string())
+                    .unwrap(),
+                name: n.to_string(),
+                owner: n.to_string(),
+                total: u32::MAX,
+            })
+            .collect();
+        app.main = match step % 4 {
+            0 => MainContent::Loading(name.into()),
+            1 => MainContent::Message(name.into()),
+            2 => MainContent::Tracks {
+                title: name.into(),
+                source: TrackSource::Uris,
+                tracks: WEIRD.iter().map(|n| track(n)).collect(),
+            },
+            _ => MainContent::Contexts {
+                title: name.into(),
+                kind: SearchKind::ALL[step % 4],
+                items: WEIRD
+                    .iter()
+                    .map(|n| ContextEntry {
+                        name: n.to_string(),
+                        detail: n.to_string(),
+                        id: rspotify::model::PlayContextId::Artist(
+                            rspotify::model::ArtistId::from_id(
+                                "0OdUWJ0sBjDrqHygGUXeCF".to_string(),
+                            )
+                            .unwrap(),
+                        ),
+                    })
+                    .collect(),
+            },
+        };
+        // Selecciones fuera de rango también deben aguantar.
+        app.main_state.select(Some(step * 7));
+        app.library_state.select(Some(step * 3));
+        app.big_cover = step.is_multiple_of(3);
+        app.search_input = name.into();
+        app.popup = match step % 5 {
+            0 => Popup::Search,
+            1 => Popup::Help,
+            2 => Popup::Devices {
+                devices: None,
+                state: Default::default(),
+            },
+            3 => Popup::Devices {
+                devices: Some(
+                    WEIRD
+                        .iter()
+                        .map(|n| DeviceEntry {
+                            id: None,
+                            name: n.to_string(),
+                            kind: n.to_string(),
+                            active: true,
+                        })
+                        .collect(),
+                ),
+                state: Default::default(),
+            },
+            _ => Popup::None,
+        };
+    }
+
+    #[tokio::test]
+    async fn draws_every_state_at_every_size() {
+        let (mut app, _rx) = test_app();
+        let mut step = 0;
+        for width in (1..=130).step_by(7) {
+            for height in (1..=45).step_by(4) {
+                all_states(&mut app, step);
+                step += 1;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|f| draw(f, &mut app)).unwrap();
+                terminal
+                    .draw(|f| draw_fallback(f, WEIRD[step % WEIRD.len()]))
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cover_robustness {
+    use image::{DynamicImage, Rgb, RgbImage};
+    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui_image::picker::ProtocolType;
+
+    use super::*;
+    use crate::app::tests::test_app;
+
+    /// La carátula se codifica con cada protocolo gráfico y a cualquier
+    /// tamaño (incluso diminuto) sin fallar.
+    #[tokio::test]
+    async fn cover_renders_with_every_protocol_and_size() {
+        for protocol in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Sixel,
+            ProtocolType::Kitty,
+            ProtocolType::Iterm2,
+        ] {
+            let (mut app, mut rx) = test_app();
+            app.picker.set_protocol_type(protocol);
+            for (w, h) in [(1, 1), (3, 2), (300, 1), (1, 300), (64, 64)] {
+                let img = RgbImage::from_fn(w, h, |x, y| Rgb([x as u8, y as u8, 200]));
+                let proto = app.picker.new_resize_protocol(DynamicImage::ImageRgb8(img));
+                app.cover.replace_protocol(proto);
+                for (width, height) in [(20, 14), (60, 20), (120, 40), (8, 12)] {
+                    for big in [false, true] {
+                        app.big_cover = big;
+                        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                        terminal.draw(|f| draw(f, &mut app)).unwrap();
+                        // Procesa los redimensionados pendientes, como el bucle real.
+                        while let Ok(request) = rx.try_recv() {
+                            if let Ok(resp) = request.resize_encode() {
+                                app.cover.update_resized_protocol(resp);
+                            }
+                        }
+                        terminal.draw(|f| draw(f, &mut app)).unwrap();
+                    }
+                }
+            }
+        }
     }
 }

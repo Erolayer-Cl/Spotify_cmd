@@ -1,7 +1,7 @@
 //! Capa fina sobre `rspotify`: convierte los modelos de la API en estructuras
 //! sencillas para la interfaz y traduce los errores a mensajes legibles.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use futures::TryStreamExt;
@@ -195,34 +195,106 @@ fn playlist_entry(p: SimplifiedPlaylist) -> PlaylistEntry {
 // Errores
 // ---------------------------------------------------------------------------
 
-/// Traduce un error de la API a un mensaje en español con una pista útil.
-pub fn friendly(err: ClientError) -> anyhow::Error {
-    if let ClientError::Http(http) = &err
-        && let HttpError::StatusCode(resp) = http.as_ref()
-    {
-        let msg = match resp.status().as_u16() {
-            401 => "sesión caducada o inválida (ejecuta `spotify_cmd --logout`)".to_string(),
-            403 => "Spotify denegó la acción (los controles requieren Spotify Premium, \
-                        o la acción no está permitida ahora)"
-                .to_string(),
-            404 => "no hay ningún dispositivo activo: abre Spotify en algún dispositivo \
-                        o pulsa 'd' para elegir uno"
-                .to_string(),
-            429 => "demasiadas peticiones a Spotify, espera unos segundos".to_string(),
-            code => format!("Spotify respondió con el código {code}"),
-        };
-        return anyhow!(msg);
+/// Error de la API con el código HTTP, para que la interfaz pueda reaccionar
+/// (por ejemplo, esperar lo que indique `Retry-After` ante un 429).
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: Option<u16>,
+    pub retry_after: Option<Duration>,
+    message: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
-    anyhow!("{err}")
+}
+
+impl std::error::Error for ApiError {}
+
+#[cfg(test)]
+impl ApiError {
+    pub fn rate_limited(retry_after: Option<Duration>) -> Self {
+        ApiError {
+            status: Some(429),
+            retry_after,
+            message: status_message(429, Kind::Query, retry_after),
+        }
+    }
+}
+
+/// Qué tipo de petición falló: cambia el significado de algunos códigos.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Query,
+    Player,
+}
+
+/// Traduce un error de la API a un mensaje en español con una pista útil.
+fn friendly(err: ClientError, kind: Kind) -> anyhow::Error {
+    let ClientError::Http(http) = &err else {
+        return anyhow!("{err}");
+    };
+    let HttpError::StatusCode(resp) = http.as_ref() else {
+        return anyhow!("sin conexión con Spotify ({err})");
+    };
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let message = status_message(status, kind, retry_after);
+    anyhow::Error::new(ApiError {
+        status: Some(status),
+        retry_after,
+        message,
+    })
+}
+
+fn status_message(status: u16, kind: Kind, retry_after: Option<Duration>) -> String {
+    match (status, kind) {
+        (401, _) => {
+            "sesión caducada o inválida (ejecuta `spotify_cmd --logout` y vuelve a entrar)".into()
+        }
+        (403, Kind::Player) => {
+            "Spotify denegó la acción (los controles requieren Spotify Premium, \
+                                o la acción no está permitida ahora)"
+                .into()
+        }
+        (403, Kind::Query) => "Spotify no permite este acceso a la app \
+                               (¿tu usuario está en «User Management» de la app?)"
+            .into(),
+        (404, Kind::Player) => {
+            "no hay ningún dispositivo activo: abre Spotify en algún dispositivo \
+                                o pulsa 'd' para elegir uno"
+                .into()
+        }
+        (404, Kind::Query) => "Spotify no encontró ese contenido".into(),
+        (429, _) => match retry_after {
+            Some(d) => format!(
+                "demasiadas peticiones a Spotify, reintentando en {} s",
+                d.as_secs()
+            ),
+            None => "demasiadas peticiones a Spotify, espera unos segundos".into(),
+        },
+        (500..=599, _) => format!("Spotify tiene problemas ahora mismo (error {status})"),
+        (code, _) => format!("Spotify respondió con el código {code}"),
+    }
 }
 
 trait Friendly<T> {
     fn friendly(self) -> Result<T>;
+    fn friendly_player(self) -> Result<T>;
 }
 
 impl<T> Friendly<T> for std::result::Result<T, ClientError> {
     fn friendly(self) -> Result<T> {
-        self.map_err(friendly)
+        self.map_err(|e| friendly(e, Kind::Query))
+    }
+    fn friendly_player(self) -> Result<T> {
+        self.map_err(|e| friendly(e, Kind::Player))
     }
 }
 
@@ -485,6 +557,18 @@ pub enum Action {
 }
 
 impl Action {
+    /// Si la acción modifica la cola (para recargarla si se está mostrando).
+    pub fn changes_queue(&self) -> bool {
+        matches!(
+            self,
+            Action::Next
+                | Action::Previous
+                | Action::Queue(_)
+                | Action::PlayContext { .. }
+                | Action::PlayTracks { .. }
+        )
+    }
+
     /// Mensaje que se muestra cuando la acción termina bien.
     pub fn done_message(&self) -> Option<&'static str> {
         match self {
@@ -520,8 +604,7 @@ pub async fn perform(sp: &Client, action: Action) -> Result<()> {
         Action::PlayTracks { tracks, start } => {
             // La API limita el tamaño del cuerpo: se envía una ventana alrededor
             // de la canción elegida para que "siguiente/anterior" funcionen.
-            let from = start.saturating_sub(MAX_URIS / 4);
-            let to = (from + MAX_URIS).min(tracks.len());
+            let (from, to) = uri_window(tracks.len(), start, MAX_URIS);
             let window = tracks[from..to].to_vec();
             let offset = Offset::Position(chrono::Duration::milliseconds((start - from) as i64));
             sp.start_uris_playback(window, None, Some(offset), None)
@@ -530,7 +613,14 @@ pub async fn perform(sp: &Client, action: Action) -> Result<()> {
         Action::Queue(id) => sp.add_item_to_queue(id, None).await,
         Action::Transfer { device_id } => sp.transfer_playback(&device_id, Some(true)).await,
     }
-    .friendly()
+    .friendly_player()
+}
+
+/// Ventana `[from, to)` de como mucho `max` elementos que contiene `start`,
+/// dejando algunas canciones anteriores para que "anterior" también funcione.
+fn uri_window(len: usize, start: usize, max: usize) -> (usize, usize) {
+    let from = start.saturating_sub(max / 4).min(len.saturating_sub(max));
+    (from, (from + max).min(len))
 }
 
 /// Renueva el token si ha caducado, de uno en uno. Con PKCE cada refresh token
@@ -547,5 +637,55 @@ pub async fn ensure_token(sp: &Client) {
         .is_none_or(|t| t.is_expired());
     if expired {
         let _ = sp.refresh_token().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_window_contains_start_and_fills_up() {
+        assert_eq!(uri_window(10, 3, 100), (0, 10));
+        assert_eq!(uri_window(500, 0, 100), (0, 100));
+        assert_eq!(uri_window(500, 250, 100), (225, 325));
+        // Cerca del final la ventana se desplaza para seguir llena.
+        assert_eq!(uri_window(200, 190, 100), (100, 200));
+        for (len, start) in [(1, 0), (100, 99), (101, 100), (1000, 999)] {
+            let (from, to) = uri_window(len, start, 100);
+            assert!(from <= start && start < to && to - from <= 100);
+        }
+    }
+
+    #[test]
+    fn pick_image_prefers_medium_size() {
+        let img = |w: u32| Image {
+            height: Some(w),
+            width: Some(w),
+            url: format!("u{w}"),
+        };
+        assert_eq!(
+            pick_image(&[img(640), img(300), img(64)]).as_deref(),
+            Some("u300")
+        );
+        assert_eq!(pick_image(&[img(64)]).as_deref(), Some("u64"));
+        assert_eq!(pick_image(&[]), None);
+    }
+
+    #[test]
+    fn search_kind_cycles() {
+        let mut k = SearchKind::Tracks;
+        for _ in 0..SearchKind::ALL.len() {
+            k = k.next();
+        }
+        assert_eq!(k, SearchKind::Tracks);
+        assert_eq!(SearchKind::Tracks.prev(), SearchKind::Playlists);
+    }
+
+    #[test]
+    fn status_messages_depend_on_request_kind() {
+        assert!(status_message(404, Kind::Player, None).contains("dispositivo"));
+        assert!(!status_message(404, Kind::Query, None).contains("dispositivo"));
+        assert!(status_message(429, Kind::Query, Some(Duration::from_secs(7))).contains("7 s"));
     }
 }

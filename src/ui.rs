@@ -575,14 +575,12 @@ mod tests {
 
     use image::{DynamicImage, Rgb, RgbImage};
     use ratatui::{Terminal, backend::TestBackend};
-    use ratatui_image::picker::Picker;
     use rspotify::model::{PlayableId, PlaylistId, RepeatState, TrackId};
-    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::{
         app::TrackSource,
-        spotify::{Client, Playback, PlaylistEntry, TrackEntry},
+        spotify::{Playback, PlaylistEntry, TrackEntry},
     };
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -601,8 +599,7 @@ mod tests {
         App,
         tokio::sync::mpsc::UnboundedReceiver<ratatui_image::thread::ResizeRequest>,
     ) {
-        let (tx, rx) = unbounded_channel();
-        let mut app = App::new(Client::default(), Picker::halfblocks(), tx, 3);
+        let (mut app, rx) = crate::app::tests::test_app();
         let track = |name: &str, artist: &str, album: &str, id: &str| TrackEntry {
             name: name.into(),
             artists: artist.into(),

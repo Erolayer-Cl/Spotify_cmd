@@ -19,7 +19,7 @@ use rspotify::prelude::*;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::spotify::{
-    self, Action, Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind,
+    self, Action, ApiError, Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind,
     SearchResults, TrackEntry,
 };
 
@@ -37,11 +37,14 @@ pub enum Msg {
     },
     Search {
         request: u64,
+        title: String,
+        kind: SearchKind,
         result: Result<SearchResults>,
     },
     Devices(Result<Vec<DeviceEntry>>),
     ActionDone {
         done: Option<&'static str>,
+        refresh_queue: bool,
         result: Result<()>,
     },
     Cover {
@@ -134,8 +137,10 @@ pub struct App {
     pub main: MainContent,
     pub main_state: TableState,
     request_id: u64,
-    /// Título y origen de la lista que se está cargando desde la búsqueda.
-    pending_title: Option<(String, TrackSource)>,
+    /// Título y origen de la lista que se está cargando.
+    pending_list: Option<(String, TrackSource)>,
+    /// Tras un 429 de Spotify, no se consulta hasta este instante.
+    backoff_until: Option<Instant>,
 
     pub search_input: String,
     pub search_kind: SearchKind,
@@ -180,7 +185,8 @@ impl App {
             main: MainContent::Message("Elige una lista en la biblioteca (Enter).".into()),
             main_state: TableState::default(),
             request_id: 0,
-            pending_title: None,
+            pending_list: None,
+            backoff_until: None,
             search_input: String::new(),
             search_kind: SearchKind::Tracks,
             picker,
@@ -220,7 +226,7 @@ impl App {
     }
 
     fn poll_playback(&mut self) {
-        if self.playback_inflight {
+        if self.playback_inflight || self.backoff_until.is_some_and(|t| Instant::now() < t) {
             return;
         }
         self.playback_inflight = true;
@@ -237,22 +243,39 @@ impl App {
         self.spawn(|sp| async move { Msg::Playlists(spotify::playlists(&sp).await) });
     }
 
-    fn next_request(&mut self, loading: impl Into<String>) -> u64 {
+    /// Prepara la vista principal para una nueva lista; las respuestas de
+    /// peticiones anteriores se descartan comparando el identificador.
+    fn next_request(&mut self, title: String, source: TrackSource) -> u64 {
         self.request_id += 1;
-        self.pending_title = None;
-        self.main = MainContent::Loading(loading.into());
+        self.main = MainContent::Loading(format!("Cargando «{title}»…"));
+        self.pending_list = Some((title, source));
         self.main_state = TableState::default();
         self.request_id
     }
 
     fn do_action(&mut self, action: Action) {
         let done = action.done_message();
+        let refresh_queue = action.changes_queue();
         self.spawn(move |sp| async move {
             Msg::ActionDone {
                 done,
+                refresh_queue,
                 result: spotify::perform(&sp, action).await,
             }
         });
+    }
+
+    /// Ante un 429, pausa las consultas periódicas el tiempo que pida Spotify.
+    fn note_rate_limit(&mut self, err: &anyhow::Error) {
+        if let Some(api) = err.downcast_ref::<ApiError>()
+            && api.status == Some(429)
+        {
+            let wait = api
+                .retry_after
+                .unwrap_or(Duration::from_secs(5))
+                .min(Duration::from_secs(120));
+            self.backoff_until = Some(Instant::now() + wait);
+        }
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -288,48 +311,45 @@ impl App {
     fn open_library(&mut self, item: LibraryItem) {
         self.active_library = Some(item);
         self.focus = Focus::Main;
+        let title = self.library_title(item);
         match item {
             LibraryItem::Liked => {
-                let req = self.next_request("Cargando tus canciones favoritas…");
-                self.spawn(move |sp| async move {
-                    Msg::Tracks {
-                        request: req,
-                        result: spotify::saved_tracks(&sp).await,
-                    }
-                });
+                let req = self.next_request(title, TrackSource::Uris);
+                self.load_tracks(req, |sp| async move { spotify::saved_tracks(&sp).await });
             }
             LibraryItem::Recent => {
-                let req = self.next_request("Cargando reproducidas recientemente…");
-                self.spawn(move |sp| async move {
-                    Msg::Tracks {
-                        request: req,
-                        result: spotify::recently_played(&sp).await,
-                    }
-                });
+                let req = self.next_request(title, TrackSource::Uris);
+                self.load_tracks(req, |sp| async move { spotify::recently_played(&sp).await });
             }
             LibraryItem::Queue => {
-                let req = self.next_request("Cargando la cola…");
-                self.spawn(move |sp| async move {
-                    Msg::Tracks {
-                        request: req,
-                        result: spotify::queue(&sp).await,
-                    }
-                });
+                let req = self.next_request(title, TrackSource::Uris);
+                self.load_tracks(req, |sp| async move { spotify::queue(&sp).await });
             }
             LibraryItem::Playlist(i) => {
-                let Some(p) = self.playlists.get(i).cloned() else {
+                let Some(id) = self.playlists.get(i).map(|p| p.id.clone()) else {
                     return;
                 };
-                let req = self.next_request(format!("Cargando «{}»…", p.name));
-                let id = p.id.clone();
-                self.spawn(move |sp| async move {
-                    Msg::Tracks {
-                        request: req,
-                        result: spotify::playlist_tracks(&sp, id).await,
-                    }
-                });
+                let source = TrackSource::Context(PlayContextId::Playlist(id.clone()));
+                let req = self.next_request(title, source);
+                self.load_tracks(
+                    req,
+                    |sp| async move { spotify::playlist_tracks(&sp, id).await },
+                );
             }
         }
+    }
+
+    fn load_tracks<F, Fut>(&self, request: u64, f: F)
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Vec<TrackEntry>>> + Send + 'static,
+    {
+        self.spawn(move |sp| async move {
+            Msg::Tracks {
+                request,
+                result: f(sp).await,
+            }
+        });
     }
 
     pub fn library_title(&self, item: LibraryItem) -> String {
@@ -346,28 +366,22 @@ impl App {
     }
 
     fn open_context(&mut self, entry: ContextEntry) {
-        match entry.id.clone() {
+        let source = TrackSource::Context(entry.id.clone());
+        match entry.id {
             PlayContextId::Playlist(id) => {
                 self.active_library = None;
-                let req = self.next_request(format!("Cargando «{}»…", entry.name));
-                self.pending_title = Some((entry.name, TrackSource::Context(entry.id)));
-                self.spawn(move |sp| async move {
-                    Msg::Tracks {
-                        request: req,
-                        result: spotify::playlist_tracks(&sp, id).await,
-                    }
-                });
+                let req = self.next_request(entry.name, source);
+                self.load_tracks(
+                    req,
+                    |sp| async move { spotify::playlist_tracks(&sp, id).await },
+                );
             }
             PlayContextId::Album(id) => {
                 self.active_library = None;
-                let req = self.next_request(format!("Cargando «{}»…", entry.name));
                 let name = entry.name.clone();
-                self.pending_title = Some((entry.name, TrackSource::Context(entry.id)));
-                self.spawn(move |sp| async move {
-                    Msg::Tracks {
-                        request: req,
-                        result: spotify::album_tracks(&sp, id, &name).await,
-                    }
+                let req = self.next_request(entry.name, source);
+                self.load_tracks(req, |sp| async move {
+                    spotify::album_tracks(&sp, id, &name).await
                 });
             }
             _ => self.set_status("Los artistas solo se pueden reproducir (Enter)", false),
@@ -380,15 +394,19 @@ impl App {
             return;
         }
         let kind = self.search_kind;
+        let title = format!("Búsqueda: «{query}» · {}", kind.label());
         self.active_library = None;
         self.focus = Focus::Main;
-        let req = self.next_request(format!(
+        let req = self.next_request(title.clone(), TrackSource::Uris);
+        self.main = MainContent::Loading(format!(
             "Buscando {} «{query}»…",
             kind.label().to_lowercase()
         ));
         self.spawn(move |sp| async move {
             Msg::Search {
                 request: req,
+                title,
+                kind,
                 result: spotify::search(&sp, &query, kind).await,
             }
         });
@@ -588,7 +606,8 @@ impl App {
                 match result {
                     Ok(pb) => self.set_playback(pb),
                     Err(e) => {
-                        self.set_status(format!("Error al consultar la reproducción: {e}"), true)
+                        self.note_rate_limit(&e);
+                        self.set_status(format!("Error al consultar la reproducción: {e}"), true);
                     }
                 }
             }
@@ -602,61 +621,49 @@ impl App {
                 if request != self.request_id {
                     return;
                 }
-                let pending = self.pending_title.take();
+                let (title, source) = self
+                    .pending_list
+                    .take()
+                    .unwrap_or_else(|| ("Canciones".into(), TrackSource::Uris));
                 self.main = match result {
+                    Ok(tracks) if tracks.is_empty() => {
+                        MainContent::Message(format!("«{title}» está vacía."))
+                    }
                     Ok(tracks) => {
-                        let (title, source) = match (pending, self.active_library) {
-                            (Some((title, source)), _) => (title, source),
-                            (None, Some(LibraryItem::Playlist(i))) => (
-                                self.library_title(LibraryItem::Playlist(i)),
-                                self.playlists
-                                    .get(i)
-                                    .map(|p| {
-                                        TrackSource::Context(PlayContextId::Playlist(p.id.clone()))
-                                    })
-                                    .unwrap_or(TrackSource::Uris),
-                            ),
-                            (None, Some(item)) => (self.library_title(item), TrackSource::Uris),
-                            (None, None) => ("Canciones".into(), TrackSource::Uris),
-                        };
-                        if tracks.is_empty() {
-                            MainContent::Message(format!("«{title}» está vacía."))
-                        } else {
-                            self.main_state.select(Some(0));
-                            MainContent::Tracks {
-                                title,
-                                source,
-                                tracks,
-                            }
+                        self.main_state.select(Some(0));
+                        MainContent::Tracks {
+                            title,
+                            source,
+                            tracks,
                         }
                     }
-                    Err(e) => MainContent::Message(format!("Error: {e}")),
+                    Err(e) => MainContent::Message(format!("No se pudo cargar «{title}»: {e}")),
                 };
             }
-            Msg::Search { request, result } => {
+            Msg::Search {
+                request,
+                title,
+                kind,
+                result,
+            } => {
                 if request != self.request_id {
                     return;
                 }
-                let query = self.search_input.trim().to_string();
-                let kind = self.search_kind;
+                self.pending_list = None;
                 self.main = match result {
                     Ok(SearchResults::Tracks(tracks)) if !tracks.is_empty() => {
                         self.main_state.select(Some(0));
                         MainContent::Tracks {
-                            title: format!("Búsqueda: «{query}» · {}", kind.label()),
+                            title,
                             source: TrackSource::Uris,
                             tracks,
                         }
                     }
                     Ok(SearchResults::Contexts(items)) if !items.is_empty() => {
                         self.main_state.select(Some(0));
-                        MainContent::Contexts {
-                            title: format!("Búsqueda: «{query}» · {}", kind.label()),
-                            kind,
-                            items,
-                        }
+                        MainContent::Contexts { title, kind, items }
                     }
-                    Ok(_) => MainContent::Message(format!("Sin resultados para «{query}».")),
+                    Ok(_) => MainContent::Message(format!("{title}\n\nSin resultados.")),
                     Err(e) => MainContent::Message(format!("Error en la búsqueda: {e}")),
                 };
             }
@@ -678,18 +685,25 @@ impl App {
                     }
                 }
             }
-            Msg::ActionDone { done, result } => {
+            Msg::ActionDone {
+                done,
+                refresh_queue,
+                result,
+            } => {
                 match result {
                     Ok(()) => {
                         if let Some(text) = done {
                             self.set_status(text, false);
                         }
                     }
-                    Err(e) => self.set_status(e.to_string(), true),
+                    Err(e) => {
+                        self.note_rate_limit(&e);
+                        self.set_status(e.to_string(), true);
+                    }
                 }
                 // Spotify tarda un poco en reflejar los cambios.
                 self.schedule_refresh(Duration::from_millis(600));
-                if self.active_library == Some(LibraryItem::Queue) {
+                if refresh_queue && self.active_library == Some(LibraryItem::Queue) {
                     self.open_library(LibraryItem::Queue);
                 }
             }
@@ -733,10 +747,13 @@ impl App {
     }
 
     pub fn on_event(&mut self, event: Event) {
-        if let Event::Key(key) = event
-            && key.kind == KeyEventKind::Press
-        {
-            self.on_key(key);
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
+            Event::Paste(text) if matches!(self.popup, Popup::Search) => {
+                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                self.search_input.push_str(&clean);
+            }
+            _ => {}
         }
     }
 
@@ -887,5 +904,145 @@ pub fn repeat_label(state: RepeatState) -> &'static str {
         RepeatState::Off => "no",
         RepeatState::Context => "lista",
         RepeatState::Track => "canción",
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::spotify::ContextEntry;
+    use rspotify::model::AlbumId;
+
+    /// App sin conexión real, con dibujado de imágenes por bloques.
+    pub fn test_app() -> (App, UnboundedReceiver<ResizeRequest>) {
+        let (tx, rx) = unbounded_channel();
+        (App::new(Client::default(), Picker::halfblocks(), tx, 3), rx)
+    }
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn album(name: &str) -> ContextEntry {
+        ContextEntry {
+            name: name.into(),
+            detail: String::new(),
+            id: PlayContextId::Album(
+                AlbumId::from_id("4aawyAB9vmqN3uQ7FjRGTy".to_string()).unwrap(),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn search_typing_paste_and_stale_results() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('/')));
+        assert!(matches!(app.popup, Popup::Search));
+        for c in "que".chars() {
+            app.on_event(key(KeyCode::Char(c)));
+        }
+        // 'q' dentro del buscador escribe, no sale de la aplicación.
+        assert!(!app.should_quit);
+        app.on_event(Event::Paste("en\n".into()));
+        assert_eq!(app.search_input, "queen");
+        app.on_event(key(KeyCode::Tab));
+        assert_eq!(app.search_kind, SearchKind::Albums);
+
+        app.on_event(key(KeyCode::Enter));
+        assert!(matches!(app.popup, Popup::None));
+        assert!(matches!(app.main, MainContent::Loading(_)));
+        let current = app.request_id;
+
+        // Una respuesta de una petición anterior se ignora.
+        app.on_msg(Msg::Search {
+            request: current - 1,
+            title: "vieja".into(),
+            kind: SearchKind::Albums,
+            result: Ok(SearchResults::Contexts(vec![album("Viejo")])),
+        });
+        assert!(matches!(app.main, MainContent::Loading(_)));
+
+        app.on_msg(Msg::Search {
+            request: current,
+            title: "Búsqueda: «queen» · Álbumes".into(),
+            kind: SearchKind::Albums,
+            result: Ok(SearchResults::Contexts(vec![album("A Night at the Opera")])),
+        });
+        match &app.main {
+            MainContent::Contexts { title, items, .. } => {
+                assert!(title.contains("queen"));
+                assert_eq!(items[0].name, "A Night at the Opera");
+            }
+            other => panic!("se esperaban resultados, no {other:?}"),
+        }
+        assert_eq!(app.main_state.selected(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn opening_an_album_keeps_its_title_and_context() {
+        let (mut app, _rx) = test_app();
+        app.main = MainContent::Contexts {
+            title: "Búsqueda".into(),
+            kind: SearchKind::Albums,
+            items: vec![album("Thriller")],
+        };
+        app.main_state.select(Some(0));
+        app.focus = Focus::Main;
+        app.on_event(key(KeyCode::Char('o')));
+        // El usuario edita la búsqueda mientras carga: no debe afectar al título.
+        app.search_input = "otra cosa".into();
+        app.on_msg(Msg::Tracks {
+            request: app.request_id,
+            result: Ok(vec![TrackEntry {
+                name: "Billie Jean".into(),
+                artists: "Michael Jackson".into(),
+                album: "Thriller".into(),
+                duration_ms: 294_000,
+                id: None,
+            }]),
+        });
+        match &app.main {
+            MainContent::Tracks { title, source, .. } => {
+                assert_eq!(title, "Thriller");
+                assert!(matches!(
+                    source,
+                    TrackSource::Context(PlayContextId::Album(_))
+                ));
+            }
+            other => panic!("se esperaba la lista del álbum, no {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_pauses_polling() {
+        let (mut app, _rx) = test_app();
+        let err = anyhow::Error::new(ApiError::rate_limited(Some(Duration::from_secs(30))));
+        app.on_msg(Msg::Playback(Err(err)));
+        assert!(
+            app.backoff_until
+                .is_some_and(|t| t > Instant::now() + Duration::from_secs(25))
+        );
+        app.poll_playback();
+        assert!(
+            !app.playback_inflight,
+            "no debe consultar durante la espera"
+        );
+    }
+
+    #[test]
+    fn library_items_map_to_indexes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _g = rt.enter();
+        let (mut app, _rx) = test_app();
+        app.playlists = vec![PlaylistEntry {
+            id: rspotify::model::PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string()).unwrap(),
+            name: "P".into(),
+            owner: "o".into(),
+            total: 1,
+        }];
+        assert_eq!(app.library_item(0), Some(LibraryItem::Liked));
+        assert_eq!(app.library_item(3), Some(LibraryItem::Playlist(0)));
+        assert_eq!(app.library_item(4), None);
+        assert_eq!(app.library_len(), 4);
     }
 }

@@ -9,7 +9,7 @@ mod ui;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::EventStream;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, EventStream};
 use futures::StreamExt;
 use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
@@ -100,7 +100,16 @@ async fn try_main() -> Result<()> {
         Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
     };
 
+    // Permite pegar texto de una vez en el buscador. Si el programa falla, se
+    // desactiva antes de restaurar la terminal (el hook de ratatui va después).
+    let _ = crossterm::execute!(std::io::stdout(), EnableBracketedPaste);
+    let ratatui_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
+        ratatui_hook(info);
+    }));
     let result = run(terminal, spotify, picker, cfg.poll_secs).await;
+    let _ = crossterm::execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }

@@ -873,8 +873,9 @@ mod robustness {
     async fn draws_every_state_at_every_size() {
         let (mut app, _rx) = test_app();
         let mut step = 0;
-        for width in (1..=130).step_by(7) {
-            for height in (1..=45).step_by(4) {
+        let widths = std::iter::once(0).chain((1..=130).step_by(7));
+        for width in widths {
+            for height in std::iter::once(0).chain((1..=45).step_by(4)) {
                 all_states(&mut app, step);
                 step += 1;
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

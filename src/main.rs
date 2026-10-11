@@ -172,7 +172,9 @@ async fn run(
     let (resize_tx, mut resize_rx) = unbounded_channel();
     let mut app = App::new(spotify, picker, resize_tx, poll_secs);
     let msg_tx = app.sender();
-    app.start();
+    if let Err(reason) = terminal::guard(|| app.start()) {
+        app.report_crash(&reason);
+    }
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));

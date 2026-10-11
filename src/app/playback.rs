@@ -33,6 +33,11 @@ impl<T> Debounced<T> {
         self.pending.is_some()
     }
 
+    /// Descarta el valor pendiente sin enviarlo.
+    fn cancel(&mut self) {
+        self.pending = None;
+    }
+
     fn take_ready(&mut self) -> Option<T> {
         match &self.pending {
             Some((_, at)) if at.elapsed() >= DEBOUNCE => self.pending.take().map(|(v, _)| v),
@@ -66,7 +71,9 @@ impl App {
             if self.poll_playback() {
                 self.refresh_at = None;
             }
-        } else if self.since_last_poll() >= self.poll_every {
+        } else if self.refresh_at.is_none() && self.since_last_poll() >= self.poll_every {
+            // Con un refresco pendiente no se consulta antes de tiempo:
+            // Spotify aún no refleja la última acción.
             self.poll_playback();
         }
         // La recarga programada espera también si Spotify pidió calma.
@@ -90,21 +97,20 @@ impl App {
     }
 
     /// Consulta el estado de reproducción, salvo que ya haya una consulta en
-    /// curso o haya que esperar (429 o sin red). Devuelve si se lanzó.
+    /// curso, una acción sin respuesta (Spotify aún no la refleja) o haya que
+    /// esperar (429 o sin red). Devuelve si se lanzó.
     pub(super) fn poll_playback(&mut self) -> bool {
-        if self.playback_inflight || self.backing_off() {
+        if self.playback_inflight || self.actions_inflight > 0 || self.backing_off() {
             return false;
         }
         self.playback_inflight = true;
         self.last_poll = Some(Instant::now());
         self.poll_seq += 1;
         let seq = self.poll_seq;
-        self.spawn(move |sp| async move {
-            Msg::Playback {
-                seq,
-                result: spotify::playback(&sp).await,
-            }
-        });
+        self.spawn(
+            |sp| async move { spotify::playback(&sp).await },
+            move |result| Msg::Playback { seq, result },
+        );
         true
     }
 
@@ -127,7 +133,7 @@ impl App {
             }
             Err(e) => {
                 self.note_rate_limit(&e);
-                self.set_status(format!("Error al consultar la reproducción: {e}"), true);
+                self.show_request_error("Error al consultar la reproducción", &e);
             }
         }
     }
@@ -139,6 +145,11 @@ impl App {
         // Mientras haya un cambio sin enviar, se conserva el valor local para
         // que la pantalla no "salte" hacia atrás.
         if let (Some(new), Some(old)) = (pb.as_mut(), self.playback.as_ref()) {
+            // Un salto pendiente era para la canción anterior: no se envía ni
+            // se lleva su posición a la nueva.
+            if new.item_uri != old.item_uri {
+                self.pending_seek.cancel();
+            }
             if self.pending_seek.is_pending() {
                 new.progress_ms = old.current_progress_ms();
                 new.fetched_at = Instant::now();
@@ -167,9 +178,11 @@ impl App {
         self.backoff_until.is_some_and(|t| Instant::now() < t)
     }
 
+    /// Programa la consulta del estado para dentro de `after`. Si ya había
+    /// una pendiente se aplaza: tras varias acciones seguidas, se consulta
+    /// cuando Spotify ya refleja la última.
     fn schedule_refresh(&mut self, after: Duration) {
-        let at = Instant::now() + after;
-        self.refresh_at = Some(self.refresh_at.map_or(at, |r| r.min(at)));
+        self.refresh_at = Some(Instant::now() + after);
     }
 
     /// Espacia las consultas periódicas cuando Spotify pide calma (429) o
@@ -193,17 +206,24 @@ impl App {
     /// Envía una acción a Spotify en segundo plano.
     pub(super) fn do_action(&mut self, action: Action) {
         // Las consultas del estado ya lanzadas no reflejan esta acción: su
-        // respuesta desharía el cambio optimista (p. ej. la pausa recién pulsada).
+        // respuesta desharía el cambio optimista (p. ej. la pausa recién
+        // pulsada). Hasta que responda no se lanzan otras (`poll_playback`).
         self.fresh_poll = self.poll_seq + 1;
+        self.actions_inflight = self.actions_inflight.saturating_add(1);
+        // Un salto de posición aún sin enviar caería en la canción nueva.
+        if action.changes_track() {
+            self.pending_seek.cancel();
+        }
         let done = action.done_message();
         let refresh_queue = action.changes_queue();
-        self.spawn(move |sp| async move {
-            Msg::ActionDone {
+        self.spawn(
+            |sp| async move { spotify::perform(&sp, action).await },
+            move |result| Msg::ActionDone {
                 done,
                 refresh_queue,
-                result: spotify::perform(&sp, action).await,
-            }
-        });
+                result,
+            },
+        );
     }
 
     /// Respuesta de una acción: se avisa del resultado y se vuelve a
@@ -214,6 +234,10 @@ impl App {
         refresh_queue: bool,
         result: Result<()>,
     ) {
+        self.actions_inflight = self.actions_inflight.saturating_sub(1);
+        // Una consulta lanzada mientras la acción viajaba (posible tras un
+        // fallo inesperado, que reinicia la cuenta) tampoco la refleja.
+        self.fresh_poll = self.poll_seq + 1;
         let succeeded = result.is_ok();
         match result {
             Ok(()) => {
@@ -335,7 +359,41 @@ mod tests {
 
     use super::*;
     use crate::app::CrashOrigin;
-    use crate::app::tests::{crash, key, now_playing, test_app};
+    use crate::app::tests::{ID_A, ID_B, crash, key, now_playing, test_app};
+
+    /// Respuesta correcta de una acción.
+    fn action_done() -> Msg {
+        Msg::ActionDone {
+            done: None,
+            refresh_queue: false,
+            result: Ok(()),
+        }
+    }
+
+    /// Estado de reproducción con la canción `title` (de id `id`) sonando.
+    fn playing_track(title: &str, id: &str) -> Playback {
+        Playback {
+            item_uri: Some(format!("spotify:track:{id}")),
+            ..now_playing(title, true)
+        }
+    }
+
+    /// Aplica el estado `pb` como respuesta de una consulta nueva.
+    fn poll_answer(app: &mut App, pb: Playback) {
+        assert!(app.poll_playback());
+        app.on_msg(Msg::Playback {
+            seq: app.poll_seq,
+            result: Ok(Some(pb)),
+        });
+    }
+
+    fn progress(app: &App) -> u64 {
+        app.playback.as_ref().map_or(0, |pb| pb.progress_ms)
+    }
+
+    fn is_playing(app: &App) -> bool {
+        app.playback.as_ref().is_some_and(|pb| pb.is_playing)
+    }
 
     #[tokio::test]
     async fn rate_limit_pauses_polling() {
@@ -389,7 +447,8 @@ mod tests {
         });
         assert!(app.playback.as_ref().is_some_and(|pb| !pb.is_playing));
         assert!(!app.playback_inflight, "se puede volver a consultar");
-        // Las consultas posteriores a la acción sí se aplican.
+        // Las consultas posteriores a la respuesta de la acción sí se aplican.
+        app.on_msg(action_done());
         assert!(app.poll_playback());
         app.on_msg(Msg::Playback {
             seq: app.poll_seq,
@@ -438,6 +497,103 @@ mod tests {
         });
         assert_eq!(title(&app).as_deref(), Some("Nueva 2"));
         assert!(!app.playback_inflight);
+    }
+
+    /// Mientras la acción viaja, y hasta que Spotify ya la refleja, no se
+    /// consulta el estado: la respuesta desharía el cambio optimista (la
+    /// pausa volvería a verse como «reproduciendo»).
+    #[tokio::test]
+    async fn no_poll_until_the_action_settles() {
+        let (mut app, _rx) = test_app();
+        app.playback = Some(now_playing("A", true));
+        app.on_event(key(KeyCode::Char(' ')));
+        // Ya toca la consulta periódica (nunca se ha consultado).
+        app.on_tick();
+        assert!(
+            !app.playback_inflight,
+            "con la pausa en vuelo no se consulta"
+        );
+        app.on_msg(action_done());
+        app.on_tick();
+        assert!(!app.playback_inflight, "ni antes de que Spotify la refleje");
+        app.refresh_at = Some(Instant::now());
+        app.on_tick();
+        assert!(app.playback_inflight, "el refresco es la primera consulta");
+        assert!(app.refresh_at.is_none());
+    }
+
+    /// Con varias acciones seguidas, el refresco de una anterior no se
+    /// adelanta a que Spotify refleje la última.
+    #[tokio::test]
+    async fn refresh_waits_for_the_last_action() {
+        let (mut app, _rx) = test_app();
+        app.playback = Some(now_playing("A", true));
+        app.on_event(key(KeyCode::Char('s')));
+        app.on_msg(action_done());
+        // Pasa el tiempo: el refresco de la primera ya toca...
+        app.refresh_at = Some(Instant::now());
+        // ...pero llega otra acción y responde.
+        app.on_event(key(KeyCode::Char('r')));
+        app.on_msg(action_done());
+        assert!(
+            app.refresh_at
+                .is_some_and(|at| at > Instant::now() + SETTLE / 2)
+        );
+        app.on_tick();
+        assert!(!app.playback_inflight);
+    }
+
+    /// Si tras un fallo inesperado se llegó a consultar con una acción en
+    /// vuelo, esa respuesta no se aplica una vez que la acción respondió.
+    #[tokio::test]
+    async fn poll_sent_while_an_action_flew_is_stale() {
+        let (mut app, _rx) = test_app();
+        app.playback = Some(now_playing("A", true));
+        app.on_event(key(KeyCode::Char(' ')));
+        app.on_msg(crash(CrashOrigin::Other, "boom"));
+        assert!(
+            app.poll_playback(),
+            "un fallo no deja las consultas bloqueadas"
+        );
+        let during = app.poll_seq;
+        app.on_msg(action_done());
+        app.on_msg(Msg::Playback {
+            seq: during,
+            result: Ok(Some(now_playing("A", true))),
+        });
+        assert!(app.playback.is_some() && !is_playing(&app));
+    }
+
+    /// Un salto de posición aún sin enviar no cae en la canción siguiente
+    /// (o anterior): se descarta al cambiar de canción.
+    #[tokio::test]
+    async fn changing_track_drops_the_pending_seek() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('p')] {
+            let (mut app, _rx) = test_app();
+            app.playback = Some(now_playing("A", true));
+            app.on_event(key(KeyCode::Right));
+            assert!(app.pending_seek.is_pending());
+            app.on_event(key(code));
+            assert!(!app.pending_seek.is_pending(), "con {code:?}");
+        }
+    }
+
+    /// Si empieza otra canción con un salto pendiente (terminó la anterior),
+    /// el salto se descarta y se ve la posición real de la nueva. En la misma
+    /// canción se conserva la posición local hasta enviarlo.
+    #[tokio::test]
+    async fn new_song_drops_the_pending_seek() {
+        let (mut app, _rx) = test_app();
+        app.playback = Some(playing_track("A", ID_A));
+        app.on_event(key(KeyCode::Right));
+
+        poll_answer(&mut app, playing_track("A", ID_A));
+        assert!(app.pending_seek.is_pending());
+        assert!(progress(&app) >= SEEK_STEP_MS);
+
+        poll_answer(&mut app, playing_track("B", ID_B));
+        assert!(!app.pending_seek.is_pending());
+        assert!(progress(&app) < SEEK_STEP_MS);
     }
 
     #[test]

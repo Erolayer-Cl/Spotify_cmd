@@ -31,7 +31,7 @@ pub use queries::{
     album_tracks, devices, download_image, playback, playlist_tracks, playlists, queue,
     recently_played, saved_tracks, search,
 };
-pub use session::{RefreshFailure, ensure_token, save_session, wait_for_renewal};
+pub use session::{RefreshFailure, ensure_token, save_session, token_expired, wait_for_renewal};
 
 /// Cliente de Spotify de la app (autorización PKCE).
 pub type Client = AuthCodePkceSpotify;

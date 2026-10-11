@@ -213,7 +213,10 @@ fn random_msg(rng: &mut Lcg, app: &App) -> Msg {
             request,
             result: err(),
         },
-        4 => Msg::Devices(Ok(Vec::new())),
+        4 => Msg::Devices {
+            request: app.devices_request.wrapping_sub((rng.next() % 2) as u64),
+            result: Ok(Vec::new()),
+        },
         5 => Msg::ActionDone {
             done: Some("ok"),
             refresh_queue: true,

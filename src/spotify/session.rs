@@ -100,6 +100,15 @@ impl RefreshFailure {
     }
 }
 
+/// Hay en memoria un token caducado: una petición con él recibiría un 401.
+/// Sin token no cuenta: la petición falla sin salir a la red.
+pub async fn token_expired(sp: &Client) -> bool {
+    match sp.token.lock().await {
+        Ok(token) => token.as_ref().is_some_and(rspotify::Token::is_expired),
+        Err(_) => false,
+    }
+}
+
 async fn token_is_valid(sp: &Client) -> bool {
     match sp.token.lock().await {
         Ok(token) => token.as_ref().is_some_and(|t| !t.is_expired()),

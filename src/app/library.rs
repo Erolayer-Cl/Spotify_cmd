@@ -63,7 +63,10 @@ impl App {
             return;
         }
         self.playlists_inflight = true;
-        self.spawn(|sp| async move { Msg::Playlists(spotify::playlists(&sp).await) });
+        self.spawn(
+            |sp| async move { spotify::playlists(&sp).await },
+            Msg::Playlists,
+        );
     }
 
     /// Respuesta de la carga de las playlists.
@@ -71,7 +74,7 @@ impl App {
         self.playlists_inflight = false;
         match result {
             Ok(list) => self.replace_playlists(list),
-            Err(e) => self.set_status(format!("No se pudieron cargar las playlists: {e}"), true),
+            Err(e) => self.show_request_error("No se pudieron cargar las playlists", &e),
         }
     }
 

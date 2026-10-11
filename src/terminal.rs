@@ -90,7 +90,7 @@ pub fn fit_to_window(tui: &mut DefaultTerminal, current: &mut Rect) -> io::Resul
 /// A diferencia de `Terminal::clear`, no pregunta a la terminal la posición
 /// del cursor: algunas terminales (o un SSH lento) no responden a tiempo y eso
 /// haría fallar la aplicación.
-pub fn full_redraw(tui: &mut DefaultTerminal) -> io::Result<()> {
+pub fn full_redraw<B: Backend>(tui: &mut Terminal<B>) -> Result<(), B::Error> {
     let area = capped_area(tui.size()?);
     tui.resize(area)
 }

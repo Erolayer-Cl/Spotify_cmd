@@ -90,6 +90,9 @@ pub struct App {
     pub should_quit: bool,
     pub focus: Focus,
     pub popup: Popup,
+    /// Hay que repintar la pantalla entera antes del siguiente dibujado (ver
+    /// [`App::take_full_redraw`]).
+    full_redraw: bool,
     pub big_cover: bool,
 
     pub playback: Option<Playback>,
@@ -97,11 +100,18 @@ pub struct App {
     /// Número de la última consulta del estado de reproducción lanzada.
     poll_seq: u64,
     /// Las respuestas de consultas con un número menor están obsoletas: se
-    /// lanzaron antes de la última acción o ya se aplicó una más reciente.
+    /// lanzaron antes de que respondiera la última acción o ya se aplicó una
+    /// más reciente.
     fresh_poll: u64,
     /// Última consulta del estado de reproducción (`None` = nunca).
     last_poll: Option<Instant>,
+    /// Consulta del estado programada tras una acción, cuando Spotify ya la
+    /// refleje. Mientras esté pendiente no se hacen consultas periódicas.
     refresh_at: Option<Instant>,
+    /// Acciones enviadas a Spotify que aún no han respondido. Mientras haya
+    /// alguna no se consulta el estado: la respuesta aún no las reflejaría y
+    /// desharía el cambio optimista.
+    actions_inflight: u32,
 
     pub playlists: Vec<PlaylistEntry>,
     /// Hay una carga de las playlists en curso.
@@ -125,6 +135,10 @@ pub struct App {
 
     pub search_input: String,
     pub search_kind: SearchKind,
+    /// Número de la última petición de la lista de dispositivos: la
+    /// respuesta de una anterior (la ventana se cerró y se volvió a abrir)
+    /// se descarta.
+    devices_request: u64,
 
     pub picker: Picker,
     pub cover: ThreadProtocol,
@@ -169,6 +183,7 @@ impl App {
             should_quit: false,
             focus: Focus::Library,
             popup: Popup::None,
+            full_redraw: false,
             big_cover: false,
             playback: None,
             playback_inflight: false,
@@ -176,6 +191,7 @@ impl App {
             fresh_poll: 0,
             last_poll: None,
             refresh_at: None,
+            actions_inflight: 0,
             playlists: Vec::new(),
             playlists_inflight: false,
             library_state,
@@ -189,6 +205,7 @@ impl App {
             backoff_until: None,
             search_input: String::new(),
             search_kind: SearchKind::Tracks,
+            devices_request: 0,
             picker,
             cover: ThreadProtocol::new(resize_tx, None),
             cover_url: None,

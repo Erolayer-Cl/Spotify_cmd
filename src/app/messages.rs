@@ -31,7 +31,11 @@ pub enum Msg {
         kind: SearchKind,
         result: Result<SearchResults>,
     },
-    Devices(Result<Vec<DeviceEntry>>),
+    /// Lista de dispositivos; `request` es el número de la petición.
+    Devices {
+        request: u64,
+        result: Result<Vec<DeviceEntry>>,
+    },
     ActionDone {
         done: Option<&'static str>,
         refresh_queue: bool,
@@ -84,7 +88,7 @@ impl App {
                 kind,
                 result,
             } => self.on_search(request, title, kind, result),
-            Msg::Devices(result) => self.on_devices(result),
+            Msg::Devices { request, result } => self.on_devices(request, result),
             Msg::ActionDone {
                 done,
                 refresh_queue,
@@ -122,11 +126,15 @@ impl App {
         // respuesta no pisa a una más reciente (ver `on_playback`).
         self.playback_inflight = false;
         self.playlists_inflight = false;
+        // También pudo ser de una acción, que ya no responderá: si no, las
+        // consultas del estado quedarían bloqueadas. Si otra sigue en vuelo,
+        // su respuesta invalida lo consultado mientras (`on_action_done`).
+        self.actions_inflight = 0;
         if self.list_lost(origin) {
             self.give_up_list(reason);
         }
         if matches!(self.popup, Popup::Devices { devices: None, .. }) {
-            self.popup = Popup::None;
+            self.close_popup();
         }
         // La imagen salió del protocolo para redimensionarse y se perdió con
         // el fallo: se vuelve a preparar a partir de la descargada.

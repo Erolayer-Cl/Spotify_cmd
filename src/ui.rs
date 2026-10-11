@@ -6,7 +6,9 @@
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Flex, Layout, Rect},
+    buffer::CellWidth,
+    layout::{Alignment, Constraint, Flex, Layout, Position, Rect},
+    style::Style,
     text::{Line, Span},
     widgets::{Cell, Clear, LineGauge, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
 };
@@ -88,26 +90,50 @@ fn logo_lines(rows: &[&'static str]) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Logo centrado con un mensaje debajo (pantallas vacías o de carga).
+/// Logos que se prueban para acompañar a un mensaje, del más vistoso al más
+/// compacto, con las filas en blanco que los separan de él.
+const LOGO_CHOICES: [(&[&str], u16); 3] = [(&LOGO_LARGE, 1), (&LOGO_SMALL, 1), (&LOGO_SMALL, 0)];
+
+/// Convierte un número de filas o columnas a `u16` sin desbordarse.
+fn to_u16(n: usize) -> u16 {
+    u16::try_from(n).unwrap_or(u16::MAX)
+}
+
+/// El logo más grande que cabe en `area` junto a un mensaje de `text_rows`
+/// filas, con las filas que ocupa (separación incluida). `None` si no cabe
+/// ninguno: el mensaje tiene prioridad.
+fn logo_that_fits(area: Rect, text_rows: u16) -> Option<(&'static [&'static str], u16)> {
+    LOGO_CHOICES.into_iter().find_map(|(logo, gap)| {
+        let rows = to_u16(logo.len()).saturating_add(gap);
+        let width = logo.first().map_or(0, |row| row.cell_width());
+        let fits = rows.saturating_add(text_rows) <= area.height && width <= area.width;
+        fits.then_some((logo, rows))
+    })
+}
+
+/// Logo centrado con un mensaje debajo (pantallas vacías o de carga). El
+/// alto del mensaje se mide ya ajustado al ancho, y el logo solo se dibuja si
+/// cabe junto al mensaje entero: nunca lo tapa ni lo empuja fuera.
 fn draw_logo_message(f: &mut Frame, area: Rect, message: &str) {
-    let logo: &[&str] = if area.height >= LOGO_LARGE.len() as u16 + 4 {
-        &LOGO_LARGE
-    } else {
-        &LOGO_SMALL
-    };
-    let mut lines = logo_lines(logo);
-    lines.push(Line::raw(""));
-    lines.extend(
-        message
-            .lines()
-            .map(|l| Line::styled(l.to_string(), theme::soft())),
-    );
-    let height = lines.len() as u16;
-    let area = centered(area, area.width, height);
-    let p = Paragraph::new(lines)
+    let lines: Vec<Line> = message
+        .lines()
+        .map(|l| Line::styled(l.to_string(), theme::soft()))
+        .collect();
+    let text = Paragraph::new(lines)
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: false });
-    f.render_widget(p, area);
+    let text_rows = to_u16(text.line_count(area.width));
+    let logo = logo_that_fits(area, text_rows);
+    let logo_rows = logo.map_or(0, |(_, rows)| rows);
+
+    let block = centered(area, area.width, logo_rows.saturating_add(text_rows));
+    let [logo_area, text_area] =
+        Layout::vertical([Constraint::Length(logo_rows), Constraint::Fill(1)]).areas(block);
+    if let Some((logo, _)) = logo {
+        let logo = Paragraph::new(logo_lines(logo)).alignment(Alignment::Center);
+        f.render_widget(logo, logo_area);
+    }
+    f.render_widget(text, text_area);
 }
 
 /// Tabla con cabecera, selección y estilo comunes a todas las listas.
@@ -502,16 +528,78 @@ fn draw_search(f: &mut Frame, app: &App, main: Rect) {
             Span::raw(" "),
         ]
     });
+    let block = theme::popup("Buscar", "Tab: tipo · Enter: buscar · Esc: cerrar");
+    let inner = block.inner(area);
+    // Columnas para el texto: todo menos el indicador y el cursor.
+    let room = inner
+        .width
+        .saturating_sub(SEARCH_PROMPT.cell_width().saturating_add(1));
+    let (shown, shown_width) = tail_that_fits(&app.search_input, room);
     let lines = vec![
         Line::from_iter(std::iter::once(Span::raw(" ")).chain(tabs)),
         Line::from(vec![
-            Span::styled(" › ", theme::strong()),
-            Span::styled(app.search_input.clone(), theme::text()),
+            Span::styled(SEARCH_PROMPT, theme::strong()),
+            Span::styled(shown, theme::text()),
             Span::styled("█", theme::text()),
         ]),
     ];
-    let block = theme::popup("Buscar", "Tab: tipo · Enter: buscar · Esc: cerrar");
     f.render_widget(Paragraph::new(lines).block(block), area);
+    // El cursor real va detrás del texto: así se ve dónde se escribe y los
+    // métodos de entrada (japonés, chino…) componen en el buscador.
+    if let Some(cursor) = search_cursor(inner, shown_width) {
+        f.set_cursor_position(cursor);
+    }
+}
+
+/// Indicador delante del texto del buscador.
+const SEARCH_PROMPT: &str = " › ";
+
+/// Final de `text` que cabe en `max` columnas, medido por grafemas igual que
+/// lo dibuja ratatui. Si no cabe entero empieza por «…»: al escribir, lo que
+/// importa es el final. Devuelve el texto y su ancho en columnas.
+fn tail_that_fits(text: &str, max: u16) -> (String, u16) {
+    let span = Span::raw(text);
+    let graphemes: Vec<&str> = span
+        .styled_graphemes(Style::default())
+        .map(|g| g.symbol)
+        .collect();
+    let total = graphemes
+        .iter()
+        .fold(0u16, |acc, g| acc.saturating_add(g.cell_width()));
+    if total <= max {
+        return (graphemes.concat(), total);
+    }
+    let Some(room) = max.checked_sub(1) else {
+        return (String::new(), 0);
+    };
+    let mut width = 0u16;
+    let kept = graphemes
+        .iter()
+        .rev()
+        .take_while(|g| {
+            let next = width.saturating_add(g.cell_width());
+            let fits = next <= room;
+            if fits {
+                width = next;
+            }
+            fits
+        })
+        .count();
+    let start = graphemes.len().saturating_sub(kept);
+    let tail: String = graphemes.iter().skip(start).copied().collect();
+    (format!("…{tail}"), width.saturating_add(1))
+}
+
+/// Posición del cursor real en el buscador: detrás de las `text_width`
+/// columnas de texto, en la segunda fila del recuadro. `None` si esa fila o
+/// esa columna no se ven.
+fn search_cursor(inner: Rect, text_width: u16) -> Option<Position> {
+    let x = inner
+        .x
+        .saturating_add(SEARCH_PROMPT.cell_width())
+        .saturating_add(text_width);
+    let y = inner.y.saturating_add(1);
+    (inner.height >= 2 && x < inner.right()).then_some(Position { x, y })
 }
 
 fn draw_devices(f: &mut Frame, app: &mut App) {
@@ -768,6 +856,154 @@ mod tests {
         app.popup = Popup::Help;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         assert!(buffer_text(&terminal).contains("Ayuda"));
+    }
+
+    /// Dibuja la app en una terminal de `width × height` y devuelve el texto.
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        buffer_text(&terminal)
+    }
+
+    /// A 80×24 (el tamaño por defecto de muchas terminales) el mensaje del
+    /// panel principal se ve, y el logo lo acompaña si cabe.
+    #[test]
+    fn main_message_is_visible_at_80x24() {
+        let (mut app, _rx) = demo_app();
+        app.playback = None;
+        for text in [
+            "Elige una lista en la biblioteca (Enter).",
+            "Cargando «Tus me gusta»…",
+            "Sin resultados.",
+        ] {
+            app.main = MainContent::Message(text.into());
+            let screen = screen(&mut app, 80, 24);
+            assert!(screen.contains(text), "no se ve «{text}»:\n{screen}");
+            // Un logo en el panel principal y otro en el reproductor.
+            assert_eq!(screen.matches(LOGO_SMALL[0].trim()).count(), 2, "{screen}");
+        }
+    }
+
+    /// Si la primera línea del mensaje ocupa varias filas al ajustarse, la
+    /// última línea se sigue viendo.
+    #[test]
+    fn wrapped_message_keeps_its_last_line() {
+        let (mut app, _rx) = demo_app();
+        app.main = MainContent::Unlisted {
+            title: "Éxitos de hoy".into(),
+            message: "No se pudo cargar «Éxitos de hoy»: Spotify solo deja ver las \
+                      canciones de tus playlists o de las colaborativas\n\n\
+                      Pulsa Enter para reproducir todas sus canciones."
+                .into(),
+            context: rspotify::model::PlayContextId::Playlist(
+                PlaylistId::from_id("37i9dQZF1DXcBWIGoYBM5M".to_string()).unwrap(),
+            ),
+        };
+        for (width, height) in [(80, 24), (100, 30), (120, 40), (160, 50)] {
+            let screen = screen(&mut app, width, height);
+            assert!(
+                screen.contains("Pulsa Enter para reproducir todas sus canciones."),
+                "{width}×{height}:\n{screen}"
+            );
+            assert!(screen.contains("No se pudo cargar"), "{width}×{height}");
+        }
+    }
+
+    /// La pantalla de emergencia muestra el mensaje entero aunque el motivo
+    /// sea largo y se ajuste en varias filas.
+    #[test]
+    fn fallback_shows_the_whole_message() {
+        let reason = "index out of bounds: the len is 3 but the index is 7 en \
+                      src/ui.rs al dibujar la lista principal";
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| draw_fallback(f, reason)).unwrap();
+        let screen = buffer_text(&terminal);
+        // La última línea, ajustada, termina en una fila propia.
+        assert!(screen.contains("salir."), "{screen}");
+        assert!(screen.contains("principal"), "{screen}");
+    }
+
+    /// El logo solo se elige si cabe junto al mensaje entero: primero el
+    /// grande, luego el pequeño (con separación o sin ella) y, si no, ninguno.
+    #[test]
+    fn logo_that_fits_leaves_room_for_the_message() {
+        let area = |width, height| Rect::new(0, 0, width, height);
+        let chosen = |width, height, text_rows| {
+            logo_that_fits(area(width, height), text_rows).map(|(logo, rows)| (logo.len(), rows))
+        };
+        assert_eq!(chosen(57, 17, 1), Some((LOGO_LARGE.len(), 16)));
+        assert_eq!(chosen(57, 16, 1), Some((LOGO_SMALL.len(), 10)));
+        assert_eq!(chosen(57, 11, 1), Some((LOGO_SMALL.len(), 10)));
+        assert_eq!(chosen(57, 10, 1), Some((LOGO_SMALL.len(), 9)));
+        assert_eq!(chosen(57, 10, 2), None);
+        assert_eq!(chosen(57, 3, 5), None);
+        // Más estrecho que el logo grande: el pequeño; más que el pequeño, nada.
+        assert_eq!(chosen(20, 40, 1), Some((LOGO_SMALL.len(), 10)));
+        assert_eq!(chosen(17, 40, 1), None);
+    }
+
+    /// Con una búsqueda más larga que el campo se ve el final (con «…»
+    /// delante) y el cursor real queda detrás del texto, donde se escribe.
+    #[test]
+    fn long_search_shows_its_end_and_the_real_cursor() {
+        let (mut app, _rx) = demo_app();
+        app.popup = Popup::Search;
+        app.search_input = "Bohemian Rhapsody Remastered 2011 Queen A Night at the Opera".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        // Fila del texto: borde superior, pestañas y texto.
+        let row: String = (0..buf.area.width).map(|x| buf[(x, 2)].symbol()).collect();
+        assert!(row.contains("› …"), "{row}");
+        assert!(row.contains("at the Opera█"), "{row}");
+        let cursor_x = (0..buf.area.width)
+            .find(|&x| buf[(x, 2)].symbol() == "█")
+            .unwrap();
+        terminal.backend_mut().assert_cursor_position((cursor_x, 2));
+    }
+
+    /// Una búsqueda corta se ve entera y el cursor va justo detrás.
+    #[test]
+    fn short_search_cursor_follows_the_text() {
+        let (mut app, _rx) = demo_app();
+        app.popup = Popup::Search;
+        app.search_input = "東京".into();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        // Biblioteca (21 columnas) + borde + " › " + 4 columnas de texto.
+        let x = 21 + 1 + 3 + 4;
+        assert_eq!(terminal.backend().buffer()[(x, 2)].symbol(), "█");
+        terminal.backend_mut().assert_cursor_position((x, 2));
+    }
+
+    #[test]
+    fn tail_that_fits_keeps_the_end() {
+        let fit = tail_that_fits;
+        assert_eq!(fit("queen", 10), ("queen".into(), 5));
+        assert_eq!(fit("queen", 5), ("queen".into(), 5));
+        assert_eq!(fit("queen", 4), ("…een".into(), 4));
+        assert_eq!(fit("queen", 1), ("…".into(), 1));
+        assert_eq!(fit("queen", 0), (String::new(), 0));
+        assert_eq!(fit("", 0), (String::new(), 0));
+        // Caracteres de dos columnas: nunca se pasa del ancho.
+        assert_eq!(fit("東京事変", 8), ("東京事変".into(), 8));
+        assert_eq!(fit("東京事変", 5), ("…事変".into(), 5));
+        assert_eq!(fit("東京事変", 4), ("…変".into(), 3));
+        // Un grafema compuesto (familia) no se parte.
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(fit(&format!("a{family}"), 3), (format!("a{family}"), 3));
+        assert_eq!(fit(&format!("ab{family}"), 3), (format!("…{family}"), 3));
+    }
+
+    #[test]
+    fn search_cursor_stays_inside_the_field() {
+        let inner = Rect::new(5, 1, 10, 2);
+        assert_eq!(search_cursor(inner, 0), Some(Position { x: 8, y: 2 }));
+        assert_eq!(search_cursor(inner, 6), Some(Position { x: 14, y: 2 }));
+        assert_eq!(search_cursor(inner, 7), None);
+        // Sin la fila del texto (panel muy bajo), no hay cursor.
+        assert_eq!(search_cursor(Rect::new(5, 1, 10, 1), 0), None);
+        assert_eq!(search_cursor(Rect::new(5, 1, 2, 2), 0), None);
     }
 }
 

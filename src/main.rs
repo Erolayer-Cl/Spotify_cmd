@@ -42,7 +42,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::EventStream;
 use futures::StreamExt;
-use ratatui::DefaultTerminal;
+use ratatui::{DefaultTerminal, Terminal, backend::Backend};
 use ratatui_image::{picker::Picker, thread::ResizeRequest};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -166,8 +166,19 @@ async fn try_main() -> Result<()> {
     result
 }
 
-/// Tiempo máximo que se espera, al salir, a una renovación del token en curso.
-const RENEWAL_GRACE: Duration = Duration::from_secs(5);
+/// Tope de cada petición HTTP de rspotify: su cliente `reqwest` usa
+/// `timeout(10 s)`.
+const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Margen para guardar en disco el token renovado.
+const SAVE_GRACE: Duration = Duration::from_secs(5);
+/// Tiempo máximo que se espera, al salir, a una renovación del token en curso
+/// y a su guardado. Una renovación puede hacer dos peticiones de token (si
+/// Spotify rechaza el refresh token se adopta el de `token.json` y se renueva
+/// con él) y cortarla antes de la respuesta dejaría en disco un refresh token
+/// ya gastado: el tope cubre las dos y el guardado.
+const RENEWAL_GRACE: Duration = TOKEN_REQUEST_TIMEOUT
+    .saturating_mul(2)
+    .saturating_add(SAVE_GRACE);
 /// Si al salir la espera a la renovación pasa de este tiempo, se avisa.
 const RENEWAL_NOTICE: Duration = Duration::from_millis(300);
 
@@ -252,8 +263,10 @@ async fn run(
     let mut draw_failures = 0;
 
     while !app.should_quit {
-        // 0. Seguir el tamaño de la ventana, con tope de memoria.
+        // 0. Seguir el tamaño de la ventana, con tope de memoria, y repintar
+        // la pantalla entera si la app lo pidió.
         let _ = terminal::fit_to_window(tui, &mut area);
+        redraw_if_requested(tui, &mut app);
 
         // 1. Dibujar. Un fallo al dibujar no tumba la aplicación.
         match terminal::guard(|| tui.draw(|f| ui::draw(f, &mut app)).map(drop)) {
@@ -301,6 +314,16 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Borra la pantalla y la vuelve a dibujar entera en el siguiente frame si la
+/// app lo pidió (al cerrar una ventana sobre una carátula Sixel o iTerm2, ver
+/// [`App::take_full_redraw`]). Así la carátula se reenvía entera y no quedan
+/// restos de la ventana encima.
+fn redraw_if_requested<B: Backend>(tui: &mut Terminal<B>, app: &mut App) {
+    if app.take_full_redraw() {
+        let _ = terminal::full_redraw(tui);
+    }
 }
 
 /// Lanza los redimensionados de la carátula pedidos al dibujar. Redimensionar
@@ -439,6 +462,103 @@ mod tests {
         assert!(app.cover.protocol_type().is_some(), "la nueva queda lista");
     }
 
+    /// Una vuelta del bucle principal sobre `tui`: el repintado pedido, el
+    /// dibujado y los redimensionados de la carátula, aplicados al momento.
+    fn frame(
+        tui: &mut Terminal<ratatui::backend::TestBackend>,
+        app: &mut App,
+        requests: &mut UnboundedReceiver<ResizeRequest>,
+    ) -> String {
+        redraw_if_requested(tui, app);
+        tui.draw(|f| ui::draw(f, app)).unwrap();
+        while let Ok(request) = requests.try_recv() {
+            app.cover
+                .update_resized_protocol(request.resize_encode().unwrap());
+        }
+        let buf = tui.backend().buffer();
+        buf.content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    /// Pulsación de una tecla sin modificadores.
+    fn press(code: crossterm::event::KeyCode) -> crossterm::event::Event {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// Ventana que se abre y se cierra sobre la carátula en una prueba: su
+    /// título, la tecla que la abre y la que la cierra.
+    struct PopupCase {
+        title: &'static str,
+        open: crossterm::event::KeyCode,
+        close: crossterm::event::KeyCode,
+    }
+
+    /// Abre y cierra la ventana `case` sobre la carátula (grande si `big`)
+    /// dibujada con `protocol` en una terminal de `size`. Devuelve la pantalla
+    /// antes de abrirla y después de cerrarla.
+    fn open_and_close_over_cover(
+        protocol: ratatui_image::picker::ProtocolType,
+        big: bool,
+        size: (u16, u16),
+        case: &PopupCase,
+    ) -> (String, String) {
+        let (mut app, mut requests) = app::tests::test_app();
+        app.picker.set_protocol_type(protocol);
+        app.big_cover = big;
+        app.set_cover_image(cover());
+        let backend = ratatui::backend::TestBackend::new(size.0, size.1);
+        let mut tui = Terminal::new(backend).unwrap();
+        frame(&mut tui, &mut app, &mut requests);
+        let before = frame(&mut tui, &mut app, &mut requests);
+        assert!(
+            before.contains('\u{1b}'),
+            "{protocol:?}: se dibuja la imagen"
+        );
+
+        app.on_event(press(case.open));
+        let open = frame(&mut tui, &mut app, &mut requests);
+        assert!(open.contains(case.title), "{}: se abre", case.title);
+        app.on_event(press(case.close));
+        (before, frame(&mut tui, &mut app, &mut requests))
+    }
+
+    /// Con Sixel o iTerm2 la carátula va entera en su primera celda. La
+    /// ayuda y los dispositivos tapan parte de la carátula (pequeña o grande)
+    /// pero no esa celda: al cerrarlos, la pantalla debe quedar como antes de
+    /// abrirlos, sin restos de la ventana encima de la imagen. (El buscador
+    /// no se prueba aquí: tapa esa celda, y al reenviarse la imagen borra su
+    /// hueco con secuencias que `TestBackend` no interpreta.)
+    #[tokio::test]
+    async fn closing_popups_over_a_sixel_or_iterm2_cover_leaves_no_trace() {
+        use crossterm::event::KeyCode;
+        use ratatui_image::picker::ProtocolType;
+        let help = PopupCase {
+            title: "Ayuda",
+            open: KeyCode::Char('?'),
+            close: KeyCode::Char('x'),
+        };
+        let devices = PopupCase {
+            title: "Dispositivos",
+            open: KeyCode::Char('d'),
+            close: KeyCode::Esc,
+        };
+        for protocol in [ProtocolType::Sixel, ProtocolType::Iterm2] {
+            for (case, big, size) in [
+                (&help, false, (80, 24)),
+                (&help, true, (120, 40)),
+                (&devices, false, (80, 24)),
+                (&devices, true, (120, 40)),
+            ] {
+                let (before, after) = open_and_close_over_cover(protocol, big, size, case);
+                assert_eq!(
+                    after, before,
+                    "{protocol:?}, {} (grande: {big}, {size:?}): quedan restos",
+                    case.title
+                );
+            }
+        }
+    }
+
     #[test]
     fn exit_code_reports_errors() {
         assert_eq!(exit_code(Ok(())), 0);
@@ -458,6 +578,28 @@ mod tests {
                     .is_ok()
             })
         }
+    }
+
+    /// Espera simulada, sin dormir: el trabajo termina a los `work` de un
+    /// reloj virtual que solo avanza al esperar.
+    fn virtual_wait(work: Duration) -> impl Fn(Duration) -> std::future::Ready<bool> {
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        move |max| {
+            let now = clock.get().saturating_add(max).min(work);
+            clock.set(now);
+            std::future::ready(now >= work)
+        }
+    }
+
+    /// Al salir se espera a la renovación más larga posible (dos peticiones
+    /// de token que agotan el tope de rspotify) y a su guardado: cortarla
+    /// antes dejaría en disco un refresh token ya gastado.
+    #[tokio::test]
+    async fn exit_waits_for_the_longest_renewal() {
+        let longest = TOKEN_REQUEST_TIMEOUT * 2 + Duration::from_secs(1);
+        let wait = virtual_wait(longest);
+        let done = wait_with_notice(wait, RENEWAL_GRACE, RENEWAL_NOTICE, || {}).await;
+        assert!(done);
     }
 
     /// Una espera corta no avisa de nada.

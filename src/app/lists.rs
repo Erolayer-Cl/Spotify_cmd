@@ -161,12 +161,7 @@ impl App {
         Fut: Future<Output = Result<Vec<TrackEntry>>> + Send + 'static,
     {
         let request = self.next_request(title, source, mode);
-        self.spawn_list(move |sp| async move {
-            Msg::Tracks {
-                request,
-                result: fetch(sp).await,
-            }
-        });
+        self.spawn_list(fetch, move |result| Msg::Tracks { request, result });
     }
 
     /// Carga una playlist: al reproducirla se usa su contexto.
@@ -213,14 +208,15 @@ impl App {
             "Buscando {} «{query}»…",
             kind.label().to_lowercase()
         ));
-        self.spawn_list(move |sp| async move {
-            Msg::Search {
+        self.spawn_list(
+            move |sp| async move { spotify::search(&sp, &query, kind).await },
+            move |result| Msg::Search {
                 request,
                 title,
                 kind,
-                result: spotify::search(&sp, &query, kind).await,
-            }
-        });
+                result,
+            },
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -280,7 +276,7 @@ impl App {
         self.main = match result {
             // Si falla una recarga, se sigue viendo la lista que había.
             Err(e) if reload => {
-                self.set_status(format!("No se pudo actualizar «{title}»: {e}"), true);
+                self.show_request_error(&format!("No se pudo actualizar «{title}»"), &e);
                 return;
             }
             Err(e) => load_error(title, source, &e),
@@ -515,7 +511,10 @@ mod tests {
     async fn list_task_panics_are_attributed_to_their_request() {
         let (mut app, _rx) = test_app();
         app.begin_request("Cargando…".into());
-        app.spawn_list(|_| async { panic!("página imposible") });
+        app.spawn_list(
+            |_| async { panic!("página imposible") },
+            |result| Msg::Tracks { request: 0, result },
+        );
         let request = app.request_id;
         let msgs = responses(&mut app).await;
         assert!(msgs.iter().any(|m| matches!(

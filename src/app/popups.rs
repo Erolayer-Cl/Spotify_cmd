@@ -4,6 +4,7 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
+use ratatui_image::picker::ProtocolType;
 
 use super::{App, Msg, Popup};
 use crate::keymap::{Command, step_index};
@@ -11,15 +12,35 @@ use crate::spotify::{self, Action, DeviceEntry};
 
 impl App {
     // -----------------------------------------------------------------------
+    // Cierre
+    // -----------------------------------------------------------------------
+
+    /// Cierra la ventana emergente abierta. Todas se cierran por aquí: si la
+    /// ventana pudo dejar restos sobre la carátula, se pide repintar la
+    /// pantalla entera (ver [`leaves_trace_on_cover`]).
+    pub(super) fn close_popup(&mut self) {
+        let closed = std::mem::replace(&mut self.popup, Popup::None);
+        if leaves_trace_on_cover(&closed, self.picker.protocol_type()) {
+            self.full_redraw = true;
+        }
+    }
+
+    /// `true` (una sola vez) si hay que repintar la pantalla entera antes del
+    /// siguiente dibujado.
+    pub fn take_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.full_redraw)
+    }
+
+    // -----------------------------------------------------------------------
     // Buscador
     // -----------------------------------------------------------------------
 
     /// En el buscador las teclas escriben texto en vez de ejecutar órdenes.
     pub(super) fn on_search_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.popup = Popup::None,
+            KeyCode::Esc => self.close_popup(),
             KeyCode::Enter => {
-                self.popup = Popup::None;
+                self.close_popup();
                 self.run_search();
             }
             KeyCode::Tab => self.search_kind = self.search_kind.next(),
@@ -51,13 +72,19 @@ impl App {
     // Dispositivos
     // -----------------------------------------------------------------------
 
-    /// Abre la ventana de dispositivos y los pide a Spotify.
+    /// Abre la ventana de dispositivos y los pide a Spotify. La respuesta de
+    /// una petición anterior que siga en curso ya no se aplicará.
     pub(super) fn open_devices(&mut self) {
         self.popup = Popup::Devices {
             devices: None,
             state: ListState::default(),
         };
-        self.spawn(|sp| async move { Msg::Devices(spotify::devices(&sp).await) });
+        self.devices_request = self.devices_request.wrapping_add(1);
+        let request = self.devices_request;
+        self.spawn(
+            |sp| async move { spotify::devices(&sp).await },
+            move |result| Msg::Devices { request, result },
+        );
     }
 
     /// Orden recibida con la ventana de dispositivos abierta.
@@ -66,7 +93,7 @@ impl App {
             return;
         };
         match command {
-            Command::Back | Command::Quit => self.popup = Popup::None,
+            Command::Back | Command::Quit => self.close_popup(),
             // 'd' vuelve a buscar (como indica la ventana sin dispositivos),
             // salvo que ya se esté buscando.
             Command::OpenDevices => {
@@ -88,7 +115,7 @@ impl App {
                     .selected()
                     .and_then(|i| list.get(i))
                     .and_then(|d| d.id.clone());
-                self.popup = Popup::None;
+                self.close_popup();
                 match device {
                     Some(device_id) => self.do_action(Action::Transfer { device_id }),
                     None => self.set_status("Ese dispositivo no se puede controlar", true),
@@ -98,8 +125,14 @@ impl App {
         }
     }
 
-    /// Respuesta de la lista de dispositivos (si la ventana sigue abierta).
-    pub(super) fn on_devices(&mut self, result: Result<Vec<DeviceEntry>>) {
+    /// Respuesta de la petición `request` de la lista de dispositivos. Solo
+    /// se aplica la de la última petición, y si la ventana sigue abierta: una
+    /// anterior cerraría la ventana con un error falso o cambiaría la lista
+    /// mientras se elige.
+    pub(super) fn on_devices(&mut self, request: u64, result: Result<Vec<DeviceEntry>>) {
+        if request != self.devices_request {
+            return;
+        }
         if let Popup::Devices { devices, state } = &mut self.popup {
             match result {
                 Ok(list) => {
@@ -108,12 +141,25 @@ impl App {
                     *devices = Some(list);
                 }
                 Err(e) => {
-                    self.popup = Popup::None;
-                    self.set_status(format!("No se pudieron listar los dispositivos: {e}"), true);
+                    self.close_popup();
+                    self.show_request_error("No se pudieron listar los dispositivos", &e);
                 }
             }
         }
     }
+}
+
+/// Si cerrar `popup` puede dejar restos de la ventana sobre la carátula.
+///
+/// Con Sixel o iTerm2 la imagen entera va en su primera celda y ratatui no
+/// vuelve a enviar las demás. La ayuda y los dispositivos, centrados en la
+/// pantalla, tapan parte de la carátula pero no esa celda: al cerrarlos, la
+/// imagen no se reenvía y lo que pintaron encima se queda. El buscador no
+/// hace falta: arriba del todo del panel, o tapa esa celda (y la imagen se
+/// reenvía, borrando antes su hueco) o no toca la carátula.
+fn leaves_trace_on_cover(popup: &Popup, protocol: ProtocolType) -> bool {
+    matches!(popup, Popup::Help | Popup::Devices { .. })
+        && matches!(protocol, ProtocolType::Sixel | ProtocolType::Iterm2)
 }
 
 /// Texto pegado en el buscador: los saltos de línea y tabuladores separan
@@ -150,8 +196,8 @@ mod tests {
     use crossterm::event::Event;
 
     use super::*;
-    use crate::app::MainContent;
-    use crate::app::tests::{album, key, status, test_app};
+    use crate::app::tests::{album, crash, key, status, test_app};
+    use crate::app::{CrashOrigin, MainContent};
     use crate::spotify::{SearchKind, SearchResults};
 
     fn key_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -257,6 +303,124 @@ mod tests {
         assert_eq!(pasted_text("\n\t\u{0}"), "");
     }
 
+    fn device(name: &str, active: bool) -> DeviceEntry {
+        DeviceEntry {
+            id: Some(name.into()),
+            name: name.into(),
+            kind: "Smartphone".into(),
+            active,
+        }
+    }
+
+    /// Si la ventana se cerró y se volvió a abrir, la respuesta de la
+    /// petición anterior no la cierra con un error falso ni cambia la lista
+    /// (y la selección) mientras se elige.
+    #[tokio::test]
+    async fn stale_device_answers_are_ignored() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('d')));
+        let old = app.devices_request;
+        app.on_event(key(KeyCode::Esc));
+        app.on_event(key(KeyCode::Char('d')));
+
+        app.on_msg(Msg::Devices {
+            request: old,
+            result: Err(anyhow::anyhow!("tiempo agotado")),
+        });
+        assert!(matches!(app.popup, Popup::Devices { devices: None, .. }));
+        assert_eq!(status(&app), None);
+
+        app.on_msg(Msg::Devices {
+            request: app.devices_request,
+            result: Ok(vec![device("Móvil", false), device("Altavoz", true)]),
+        });
+        app.on_event(key(KeyCode::Char('k')));
+        app.on_msg(Msg::Devices {
+            request: old,
+            result: Ok(vec![device("Altavoz", true)]),
+        });
+        match &app.popup {
+            Popup::Devices {
+                devices: Some(list),
+                state,
+            } => {
+                assert_eq!(list.len(), 2);
+                assert_eq!(state.selected(), Some(0), "se mantiene el móvil elegido");
+            }
+            _ => panic!("la ventana debe seguir abierta con su lista"),
+        }
+    }
+
+    /// Abre una ventana y la cierra por uno de sus caminos.
+    fn open_and_close(app: &mut App, path: &str) {
+        match path {
+            "ayuda" => {
+                app.on_event(key(KeyCode::Char('?')));
+                app.on_event(key(KeyCode::Char('x')));
+            }
+            "dispositivos: Esc" => {
+                app.on_event(key(KeyCode::Char('d')));
+                app.on_event(key(KeyCode::Esc));
+            }
+            "dispositivos: error" => {
+                app.on_event(key(KeyCode::Char('d')));
+                app.on_msg(Msg::Devices {
+                    request: app.devices_request,
+                    result: Err(anyhow::anyhow!("sin red")),
+                });
+            }
+            "dispositivos: elegir" => {
+                app.on_event(key(KeyCode::Char('d')));
+                app.on_msg(Msg::Devices {
+                    request: app.devices_request,
+                    result: Ok(vec![device("Móvil", true)]),
+                });
+                app.on_event(key(KeyCode::Enter));
+            }
+            "dispositivos: fallo" => {
+                app.on_event(key(KeyCode::Char('d')));
+                app.on_msg(crash(CrashOrigin::Other, "fallo simulado"));
+            }
+            "buscador" => {
+                app.on_event(key(KeyCode::Char('/')));
+                app.on_event(key(KeyCode::Esc));
+            }
+            other => panic!("camino desconocido: {other}"),
+        }
+    }
+
+    /// Con Sixel o iTerm2, cerrar la ayuda o los dispositivos (por cualquier
+    /// camino) pide repintar la pantalla entera una vez; con los demás
+    /// protocolos, o al cerrar el buscador, no hace falta.
+    #[tokio::test]
+    async fn closing_popups_over_sixel_or_iterm2_asks_for_a_full_redraw() {
+        let paths = [
+            "ayuda",
+            "dispositivos: Esc",
+            "dispositivos: error",
+            "dispositivos: elegir",
+            "dispositivos: fallo",
+            "buscador",
+        ];
+        for protocol in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            for path in paths {
+                let (mut app, _rx) = test_app();
+                app.picker.set_protocol_type(protocol);
+                open_and_close(&mut app, path);
+                assert!(matches!(app.popup, Popup::None), "{path}: sigue abierta");
+                let expected = path != "buscador"
+                    && matches!(protocol, ProtocolType::Sixel | ProtocolType::Iterm2);
+                assert_eq!(app.take_full_redraw(), expected, "{protocol:?}, {path}");
+                assert!(!app.take_full_redraw(), "se pide una sola vez");
+            }
+        }
+    }
+
     /// Enter mientras se buscan dispositivos (o sin ninguno) no cierra la
     /// ventana con un aviso engañoso, y 'd' vuelve a buscar.
     #[tokio::test]
@@ -267,7 +431,10 @@ mod tests {
         assert!(matches!(app.popup, Popup::Devices { devices: None, .. }));
         assert_eq!(status(&app), None);
 
-        app.on_msg(Msg::Devices(Ok(Vec::new())));
+        app.on_msg(Msg::Devices {
+            request: app.devices_request,
+            result: Ok(Vec::new()),
+        });
         app.on_event(key(KeyCode::Enter));
         assert!(matches!(
             app.popup,

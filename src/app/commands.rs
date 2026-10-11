@@ -31,7 +31,7 @@ impl App {
         }
         match self.popup {
             Popup::Search => self.on_search_key(key),
-            Popup::Help => self.popup = Popup::None,
+            Popup::Help => self.close_popup(),
             Popup::Devices { .. } => {
                 if let Some(command) = command {
                     self.on_devices_command(command);

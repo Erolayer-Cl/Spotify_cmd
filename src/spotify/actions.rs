@@ -77,6 +77,18 @@ impl Action {
         )
     }
 
+    /// Si la acción cambia la canción que suena: un salto de posición aún
+    /// sin enviar ya no le corresponde.
+    pub fn changes_track(&self) -> bool {
+        matches!(
+            self,
+            Action::Next
+                | Action::Previous
+                | Action::PlayContext { .. }
+                | Action::PlayTracks { .. }
+        )
+    }
+
     /// Mensaje que se muestra cuando la acción termina bien.
     pub fn done_message(&self) -> Option<&'static str> {
         match self {
@@ -143,6 +155,36 @@ mod tests {
             ContextStart::Position(39).offset(),
             Offset::Position(chrono::Duration::milliseconds(39))
         );
+    }
+
+    /// Solo las acciones que cambian de canción descartan un salto de
+    /// posición pendiente.
+    #[test]
+    fn only_track_changes_drop_a_pending_seek() {
+        let album = rspotify::model::AlbumId::from_id("4aawyAB9vmqN3uQ7FjRGTy").unwrap();
+        let play_context = Action::PlayContext {
+            context: PlayContextId::Album(album),
+            start: None,
+        };
+        let play_tracks = Action::PlayTracks {
+            tracks: Vec::new(),
+            start: 0,
+        };
+        for action in [Action::Next, Action::Previous, play_context, play_tracks] {
+            assert!(action.changes_track(), "{action:?}");
+        }
+        for action in [
+            Action::TogglePlay { playing: true },
+            Action::Seek { position_ms: 0 },
+            Action::Volume(50),
+            Action::Shuffle(true),
+            Action::Repeat(RepeatState::Track),
+            Action::Transfer {
+                device_id: "altavoz".into(),
+            },
+        ] {
+            assert!(!action.changes_track(), "{action:?}");
+        }
     }
 
     #[test]

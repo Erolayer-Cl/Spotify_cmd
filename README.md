@@ -56,3 +56,10 @@ Ten Spotify abierto en algún dispositivo (móvil, PC…): esta herramienta es u
 | `q` | Salir |
 
 ¿Problemas? `spotify_cmd --help` (opciones `--manual-auth` para SSH, `--halfblocks` si la imagen se ve mal y `--logout`).
+
+## Pruebas
+
+```bash
+cargo test                  # 25 pruebas unitarias (incluye UI en todos los tamaños y 5000 teclas al azar)
+tests/e2e/run_all.sh        # app real contra una API de Spotify simulada: funcional, caos y velocidad (requiere `pip install pyte`)
+```

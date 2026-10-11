@@ -2563,6 +2563,7 @@ dependencies = [
  "reqwest",
  "rspotify",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "webbrowser",

@@ -18,7 +18,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
+use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend, layout::Rect};
 
 /// `true` mientras la terminal está en modo pantalla completa.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -48,6 +48,16 @@ pub fn init() -> io::Result<DefaultTerminal> {
         return Err(e);
     }
     Terminal::new(CrosstermBackend::new(stdout())).inspect_err(|_| restore())
+}
+
+/// Borra la pantalla y obliga a redibujarla entera en el siguiente frame.
+///
+/// A diferencia de `Terminal::clear`, no pregunta a la terminal la posición
+/// del cursor: algunas terminales (o un SSH lento) no responden a tiempo y eso
+/// haría fallar la aplicación.
+pub fn full_redraw(tui: &mut DefaultTerminal) -> io::Result<()> {
+    let size = tui.size()?;
+    tui.resize(Rect::new(0, 0, size.width, size.height))
 }
 
 /// Deja la terminal como estaba. Se puede llamar varias veces sin problema, y

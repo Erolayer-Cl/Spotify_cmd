@@ -9,8 +9,8 @@ use rspotify::{
     AuthCodePkceSpotify, ClientError,
     http::HttpError,
     model::{
-        AdditionalType, AlbumId, FullTrack, Image, Market, Offset, Page, PlayableItem, PlaylistId,
-        RepeatState, SearchResult, SearchType, SimplifiedPlaylist,
+        AdditionalType, AlbumId, EpisodeId, FullTrack, Image, Market, Offset, Page, PlayableItem,
+        PlaylistId, RepeatState, SearchResult, SearchType, SimplifiedPlaylist, TrackId,
     },
     prelude::*,
 };
@@ -165,18 +165,92 @@ fn track_entry(t: &FullTrack) -> TrackEntry {
     }
 }
 
-fn playable_entry(item: &PlayableItem) -> Option<TrackEntry> {
+/// Lo que la interfaz necesita de una canción o episodio, venga como venga.
+struct ItemInfo {
+    title: String,
+    artists: String,
+    album: String,
+    cover_url: Option<String>,
+    duration_ms: u64,
+    id: Option<PlayableId<'static>>,
+}
+
+/// Extrae la información de cualquier elemento reproducible. Si `rspotify` no
+/// lo entendió (`Unknown`, p. ej. porque Spotify cambió el formato), se lee el
+/// JSON crudo de forma tolerante en vez de descartarlo.
+fn item_info(item: &PlayableItem) -> Option<ItemInfo> {
     match item {
-        PlayableItem::Track(t) => Some(track_entry(t)),
-        PlayableItem::Episode(e) => Some(TrackEntry {
-            name: e.name.clone(),
+        PlayableItem::Track(t) => Some(ItemInfo {
+            title: t.name.clone(),
+            artists: join_artists(t.artists.iter().map(|a| a.name.as_str())),
+            album: t.album.name.clone(),
+            cover_url: pick_image(&t.album.images),
+            duration_ms: t.duration.num_milliseconds().max(0) as u64,
+            id: t.id.clone().map(PlayableId::Track),
+        }),
+        PlayableItem::Episode(e) => Some(ItemInfo {
+            title: e.name.clone(),
             artists: e.show.name.clone(),
             album: "Podcast".into(),
+            cover_url: pick_image(&e.images).or_else(|| pick_image(&e.show.images)),
             duration_ms: e.duration.num_milliseconds().max(0) as u64,
             id: Some(PlayableId::Episode(e.id.clone())),
         }),
-        _ => None,
+        PlayableItem::Unknown(raw) => lenient_info(raw),
     }
+}
+
+fn lenient_info(v: &serde_json::Value) -> Option<ItemInfo> {
+    let text = |v: Option<&serde_json::Value>| v.and_then(|x| x.as_str()).map(str::to_string);
+    let show = v.get("show");
+    let artists = match v.get("artists").and_then(|a| a.as_array()) {
+        Some(list) => join_artists(list.iter().filter_map(|a| a.get("name")?.as_str())),
+        None => text(show.and_then(|s| s.get("name"))).unwrap_or_default(),
+    };
+    let album = text(v.get("album").and_then(|a| a.get("name"))).unwrap_or_else(|| {
+        if show.is_some() {
+            "Podcast".into()
+        } else {
+            String::new()
+        }
+    });
+    let images = v
+        .get("album")
+        .and_then(|a| a.get("images"))
+        .or_else(|| v.get("images"))
+        .and_then(|imgs| serde_json::from_value::<Vec<Image>>(imgs.clone()).ok())
+        .unwrap_or_default();
+    Some(ItemInfo {
+        title: text(v.get("name"))?,
+        artists,
+        album,
+        cover_url: pick_image(&images),
+        duration_ms: v.get("duration_ms").and_then(|d| d.as_u64()).unwrap_or(0),
+        id: v
+            .get("uri")
+            .and_then(|u| u.as_str())
+            .and_then(playable_id_from_uri),
+    })
+}
+
+/// `spotify:track:…` o `spotify:episode:…` → id reproducible.
+fn playable_id_from_uri(uri: &str) -> Option<PlayableId<'static>> {
+    if let Ok(id) = TrackId::from_uri(uri) {
+        return Some(PlayableId::Track(id.into_static()));
+    }
+    EpisodeId::from_uri(uri)
+        .ok()
+        .map(|id| PlayableId::Episode(id.into_static()))
+}
+
+fn playable_entry(item: &PlayableItem) -> Option<TrackEntry> {
+    item_info(item).map(|info| TrackEntry {
+        name: info.title,
+        artists: info.artists,
+        album: info.album,
+        duration_ms: info.duration_ms,
+        id: info.id,
+    })
 }
 
 fn playlist_entry(p: SimplifiedPlaylist) -> PlaylistEntry {
@@ -329,24 +403,17 @@ pub async fn playback(sp: &Client) -> Result<Option<Playback>> {
         return Ok(None);
     };
 
-    let (title, artists, album, cover_url, duration_ms, item_uri) = match &ctx.item {
-        Some(PlayableItem::Track(t)) => (
-            t.name.clone(),
-            join_artists(t.artists.iter().map(|a| a.name.as_str())),
-            t.album.name.clone(),
-            pick_image(&t.album.images),
-            t.duration.num_milliseconds().max(0) as u64,
-            t.id.as_ref().map(|id| id.uri()),
+    let info = ctx.item.as_ref().and_then(item_info);
+    let (title, artists, album, cover_url, duration_ms, item_uri) = match info {
+        Some(i) => (
+            i.title,
+            i.artists,
+            i.album,
+            i.cover_url,
+            i.duration_ms,
+            i.id.map(|id| id.uri()),
         ),
-        Some(PlayableItem::Episode(e)) => (
-            e.name.clone(),
-            e.show.name.clone(),
-            "Podcast".into(),
-            pick_image(&e.images).or_else(|| pick_image(&e.show.images)),
-            e.duration.num_milliseconds().max(0) as u64,
-            Some(e.id.uri()),
-        ),
-        _ => (
+        None => (
             "(sin información)".into(),
             String::new(),
             String::new(),
@@ -792,5 +859,32 @@ mod tests {
         assert!(status_message(404, Kind::Player, None).contains("dispositivo"));
         assert!(!status_message(404, Kind::Query, None).contains("dispositivo"));
         assert!(status_message(429, Kind::Query, Some(Duration::from_secs(7))).contains("7 s"));
+    }
+}
+
+#[cfg(test)]
+mod parsing {
+    use rspotify::model::{CurrentUserQueue, Page, PlaylistItem};
+
+    use super::playable_entry;
+
+    #[test]
+    fn parses_playlist_items() {
+        let raw = include_str!("../tests/fixtures/playlist_items.json");
+        let page: Page<PlaylistItem> = serde_json::from_str(raw).unwrap();
+        let entries: Vec<_> = page
+            .items
+            .iter()
+            .filter_map(|i| i.item.as_ref().and_then(playable_entry))
+            .collect();
+        println!("{:?}", page.items.first().map(|i| &i.item));
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn parses_queue() {
+        let raw = include_str!("../tests/fixtures/queue.json");
+        let q: CurrentUserQueue = serde_json::from_str(raw).unwrap();
+        assert_eq!(q.queue.iter().filter_map(playable_entry).count(), 4);
     }
 }

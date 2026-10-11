@@ -33,12 +33,19 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         ),
         ..Default::default()
     };
-    let rs_config = rspotify::Config {
+    let mut rs_config = rspotify::Config {
         token_cached: true,
         token_refreshing: true,
         cache_path: config::token_path()?,
         ..Default::default()
     };
+    // Solo para pruebas: apuntar a un servidor que imita la API de Spotify.
+    if let Ok(url) = std::env::var("SPOTIFY_CMD_API_URL") {
+        rs_config.api_base_url = url;
+    }
+    if let Ok(url) = std::env::var("SPOTIFY_CMD_AUTH_URL") {
+        rs_config.auth_base_url = url;
+    }
     let mut spotify = AuthCodePkceSpotify::with_config(creds, oauth, rs_config);
 
     // 1. Token guardado de una sesión anterior.

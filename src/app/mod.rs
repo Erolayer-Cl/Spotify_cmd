@@ -134,6 +134,9 @@ pub struct App {
     backoff_until: Option<Instant>,
 
     pub search_input: String,
+    /// La búsqueda anterior se muestra atenuada y lo que se escriba la
+    /// sustituye (así no se pega al texto viejo).
+    pub search_fresh: bool,
     pub search_kind: SearchKind,
     /// Número de la última petición de la lista de dispositivos: la
     /// respuesta de una anterior (la ventana se cerró y se volvió a abrir)
@@ -204,6 +207,7 @@ impl App {
             list_task: None,
             backoff_until: None,
             search_input: String::new(),
+            search_fresh: false,
             search_kind: SearchKind::Tracks,
             devices_request: 0,
             picker,

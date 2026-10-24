@@ -144,8 +144,10 @@ fn status_message(status: u16, kind: Kind, retry_after: Option<Duration>) -> Str
         }
         (404, _) => "Spotify no encontró ese contenido".into(),
         (429, _) => match retry_after {
+            // Solo el estado se vuelve a consultar solo: las acciones no se
+            // reintentan, así que se dice cuánto esperar, sin prometer más.
             Some(d) => format!(
-                "demasiadas peticiones a Spotify, reintentando en {} s",
+                "demasiadas peticiones a Spotify: espera {} s y vuelve a intentarlo",
                 d.as_secs()
             ),
             None => "demasiadas peticiones a Spotify, espera unos segundos".into(),

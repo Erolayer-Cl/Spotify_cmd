@@ -46,6 +46,10 @@ impl<T> Debounced<T> {
     }
 }
 
+/// Aviso cuando se pulsa un control sin nada sonando.
+const NOTHING_PLAYING: &str =
+    "No hay nada reproduciéndose. Elige una canción o un dispositivo ('d').";
+
 /// Texto del modo de repetición.
 pub fn repeat_label(state: RepeatState) -> &'static str {
     match state {
@@ -261,12 +265,18 @@ impl App {
     // Controles (con actualización optimista del estado local)
     // -----------------------------------------------------------------------
 
+    /// El estado de reproducción para un control, o un aviso si no suena nada
+    /// (así ninguna tecla "no hace nada" en silencio).
+    fn playback_or_warn(&mut self) -> Option<&mut Playback> {
+        if self.playback.is_none() {
+            self.set_status(NOTHING_PLAYING, true);
+            return None;
+        }
+        self.playback.as_mut()
+    }
+
     pub(super) fn toggle_play(&mut self) {
-        let Some(pb) = self.playback.as_mut() else {
-            self.set_status(
-                "No hay nada reproduciéndose. Elige una canción o un dispositivo ('d').",
-                true,
-            );
+        let Some(pb) = self.playback_or_warn() else {
             return;
         };
         let playing = pb.is_playing;
@@ -283,7 +293,7 @@ impl App {
     }
 
     pub(super) fn seek(&mut self, forward: bool) {
-        let Some(pb) = self.playback.as_mut() else {
+        let Some(pb) = self.playback_or_warn() else {
             return;
         };
         let current = pb.current_progress_ms();
@@ -299,7 +309,7 @@ impl App {
     }
 
     pub(super) fn change_volume(&mut self, delta: i32) {
-        let Some(pb) = self.playback.as_mut() else {
+        let Some(pb) = self.playback_or_warn() else {
             return;
         };
         let Some(vol) = pb.volume else {
@@ -322,7 +332,7 @@ impl App {
     }
 
     pub(super) fn toggle_shuffle(&mut self) {
-        let Some(pb) = self.playback.as_mut() else {
+        let Some(pb) = self.playback_or_warn() else {
             return;
         };
         pb.shuffle = !pb.shuffle;
@@ -339,7 +349,7 @@ impl App {
     }
 
     pub(super) fn cycle_repeat(&mut self) {
-        let Some(pb) = self.playback.as_mut() else {
+        let Some(pb) = self.playback_or_warn() else {
             return;
         };
         pb.repeat = match pb.repeat {
@@ -359,7 +369,7 @@ mod tests {
 
     use super::*;
     use crate::app::CrashOrigin;
-    use crate::app::tests::{ID_A, ID_B, crash, key, now_playing, test_app};
+    use crate::app::tests::{ID_A, ID_B, crash, key, now_playing, status, test_app};
 
     /// Respuesta correcta de una acción.
     fn action_done() -> Msg {
@@ -393,6 +403,44 @@ mod tests {
 
     fn is_playing(app: &App) -> bool {
         app.playback.as_ref().is_some_and(|pb| pb.is_playing)
+    }
+
+    /// Sin nada sonando, ningún control "no hace nada" en silencio: avisa y
+    /// no envía ninguna petición.
+    #[tokio::test]
+    async fn controls_without_playback_warn_and_send_nothing() {
+        let (mut app, _rx) = test_app();
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('s'),
+            KeyCode::Char('r'),
+            KeyCode::Char('+'),
+            KeyCode::Char('-'),
+            KeyCode::Left,
+            KeyCode::Right,
+        ] {
+            app.status = None;
+            app.on_event(key(code));
+            assert_eq!(status(&app), Some(NOTHING_PLAYING), "{code:?}");
+        }
+        assert_eq!(app.actions_inflight, 0, "no se envió ninguna acción");
+        assert!(!app.pending_seek.is_pending() && !app.pending_volume.is_pending());
+    }
+
+    /// Con la cola a la vista, cambiar el aleatorio la recarga (Spotify la
+    /// reordena).
+    #[tokio::test]
+    async fn shuffle_reloads_the_visible_queue() {
+        let (mut app, _rx) = test_app();
+        app.active_library = Some(LibraryItem::Queue);
+        app.playback = Some(now_playing("A", true));
+        app.on_event(key(KeyCode::Char('s')));
+        app.on_msg(Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            result: Ok(()),
+        });
+        assert!(app.list_reload_at.is_some(), "la cola debe recargarse");
     }
 
     #[tokio::test]

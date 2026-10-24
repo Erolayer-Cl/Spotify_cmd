@@ -142,6 +142,10 @@ async fn try_main() -> Result<()> {
     say_inline!("{}", logo::banner());
     let cfg = config::Config::load_or_create()?;
     let spotify = auth::authenticate(&cfg, args.manual_auth).await?;
+    // La configuración nueva solo se guarda si el inicio de sesión funcionó.
+    if let Err(e) = cfg.save_if_new() {
+        say_err!("Aviso: no se pudo guardar la configuración ({e:#})");
+    }
 
     // A partir de aquí la terminal entra en modo "pantalla completa".
     let tui = terminal::init().context("no se pudo preparar la terminal")?;

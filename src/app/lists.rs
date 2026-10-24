@@ -266,6 +266,15 @@ impl App {
     }
 
     /// Muestra las canciones recibidas para la lista `pending`.
+    /// La canción seleccionada en la lista que se ve, con su fila.
+    fn selected_track(&self) -> Option<(usize, &TrackEntry)> {
+        let row = self.main_state.selected()?;
+        match &self.main {
+            MainContent::Tracks { tracks, .. } => tracks.get(row).map(|t| (row, t)),
+            _ => None,
+        }
+    }
+
     fn show_tracks(&mut self, pending: PendingList, result: Result<Vec<TrackEntry>>) {
         let PendingList {
             title,
@@ -284,8 +293,10 @@ impl App {
                 MainContent::Message(format!("«{title}» está vacía."))
             }
             Ok(tracks) => {
+                // Al recargar (la cola tras un salto, las recientes...) la
+                // selección sigue a la canción, no al número de fila.
                 let row = if reload {
-                    kept_row(self.main_state.selected(), tracks.len())
+                    followed_row(self.selected_track(), &tracks)
                 } else {
                     0
                 };
@@ -328,6 +339,27 @@ fn kept_row(selected: Option<usize>, len: usize) -> usize {
     selected.unwrap_or(0).min(len.saturating_sub(1))
 }
 
+/// Fila de la lista nueva donde quedó la canción que estaba seleccionada
+/// (`previous`: su fila y la canción). Se compara por id, o por nombre y
+/// artista en los archivos locales sin id; si aparece varias veces gana la
+/// más cercana a la fila anterior. Si ya no está, se mantiene la fila.
+fn followed_row(previous: Option<(usize, &TrackEntry)>, tracks: &[TrackEntry]) -> usize {
+    let Some((row, old)) = previous else {
+        return 0;
+    };
+    let same_song = |t: &TrackEntry| match (&old.id, &t.id) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => t.name == old.name && t.artists == old.artists,
+        _ => false,
+    };
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| same_song(t))
+        .min_by_key(|(j, _)| j.abs_diff(row))
+        .map_or_else(|| kept_row(Some(row), tracks.len()), |(j, _)| j)
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
@@ -344,6 +376,27 @@ mod tests {
     /// Error de la API al pedir las canciones de una playlist.
     fn api_error(status: Option<u16>) -> anyhow::Error {
         anyhow::Error::new(ApiError::playlist_items(status))
+    }
+
+    fn named(names: &[&str]) -> Vec<TrackEntry> {
+        names.iter().map(|n| song(n)).collect()
+    }
+
+    /// La selección sigue a la canción cuando la lista cambia al recargarse.
+    #[test]
+    fn reload_selection_follows_the_song() {
+        let old = named(&["A", "B", "C", "D"]);
+        let c = Some((2, &old[2]));
+        // Las recientes anteponen la canción anterior: C baja una fila.
+        assert_eq!(followed_row(c, &named(&["X", "A", "B", "C", "D"])), 3);
+        // La cola tras 'n': todo sube una fila.
+        assert_eq!(followed_row(c, &named(&["B", "C", "D"])), 1);
+        // Si aparece varias veces, gana la más cercana a la fila anterior.
+        assert_eq!(followed_row(c, &named(&["C", "X", "Y", "C"])), 3);
+        // Si ya no está, se mantiene la fila (dentro de la lista).
+        assert_eq!(followed_row(c, &named(&["X", "Y", "Z", "W"])), 2);
+        assert_eq!(followed_row(c, &named(&["X"])), 0);
+        assert_eq!(followed_row(None, &named(&["X", "Y"])), 0);
     }
 
     #[tokio::test]

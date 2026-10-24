@@ -10,6 +10,8 @@ use crate::spotify::Action;
 
 /// Paso del volumen con cada pulsación.
 const VOLUME_STEP: i32 = 5;
+/// Aviso al pulsar 'a' u 'o' con la lista tapada por la carátula grande.
+pub(super) const COVER_HIDES_LIST: &str = "Cierra la carátula ('c') para ver la lista";
 
 impl App {
     /// Atiende un evento de la terminal (tecla o texto pegado).
@@ -50,8 +52,12 @@ impl App {
         use Command::*;
         match command {
             // Con la carátula grande la lista no se ve: no se actúa a ciegas
-            // sobre ella (la carátula se cierra con 'c').
-            Activate | QueueSelected | OpenSelected | Move(_) | Jump(_) if self.list_hidden() => {}
+            // sobre ella (la carátula se cierra con 'c'). 'a' y 'o' siempre
+            // miran la lista, también con el foco en la biblioteca: avisan.
+            QueueSelected | OpenSelected if self.big_cover => {
+                self.set_status(COVER_HIDES_LIST, false);
+            }
+            Activate | Move(_) | Jump(_) if self.list_hidden() => {}
             Quit => self.should_quit = true,
             Back => {}
             TogglePlay => self.toggle_play(),
@@ -63,7 +69,7 @@ impl App {
             VolumeDown => self.change_volume(-VOLUME_STEP),
             ToggleShuffle => self.toggle_shuffle(),
             CycleRepeat => self.cycle_repeat(),
-            OpenSearch => self.popup = Popup::Search,
+            OpenSearch => self.open_search(),
             OpenDevices => self.open_devices(),
             ToggleCover => self.big_cover = !self.big_cover,
             ShowHelp => self.popup = Popup::Help,
@@ -153,8 +159,24 @@ mod tests {
             app.on_event(key(code));
         }
         assert_eq!(app.main_state.selected(), Some(0));
-        assert_eq!(status(&app), None);
+        assert_eq!(status(&app), Some(COVER_HIDES_LIST), "'a' avisa");
         assert_eq!(app.fresh_poll, 0, "no se envió ninguna acción");
+
+        // Con el foco en la biblioteca, 'a' y 'o' tampoco actúan sobre la
+        // lista tapada, y j/k siguen moviendo la biblioteca.
+        app.focus = Focus::Library;
+        app.status = None;
+        app.on_event(key(KeyCode::Char('a')));
+        assert_eq!(status(&app), Some(COVER_HIDES_LIST));
+        app.status = None;
+        app.on_event(key(KeyCode::Char('o')));
+        assert_eq!(status(&app), Some(COVER_HIDES_LIST));
+        assert_eq!(app.fresh_poll, 0, "no se envió ninguna acción");
+        let library_before = app.library_state.selected();
+        app.on_event(key(KeyCode::Char('j')));
+        assert_ne!(app.library_state.selected(), library_before);
+
+        app.focus = Focus::Main;
         app.on_event(key(KeyCode::Char('c')));
         app.on_event(key(KeyCode::Char('j')));
         assert_eq!(app.main_state.selected(), Some(1));

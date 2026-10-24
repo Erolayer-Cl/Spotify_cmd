@@ -55,7 +55,7 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
         if !expired {
             return Ok(spotify);
         }
-        match spotify.refresh_token().await {
+        match spotify::refresh_keeping(&spotify).await {
             Ok(()) => {
                 save_session_or_warn(&spotify).await;
                 return Ok(spotify);
@@ -143,10 +143,16 @@ fn client_config(cache_path: std::path::PathBuf) -> rspotify::Config {
         ..Default::default()
     };
     // Solo para pruebas: apuntar a un servidor que imita la API de Spotify.
-    if let Ok(url) = std::env::var("SPOTIFY_CMD_API_URL") {
+    if let Some(url) = std::env::var("SPOTIFY_CMD_API_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    {
         rs_config.api_base_url = url;
     }
-    if let Ok(url) = std::env::var("SPOTIFY_CMD_AUTH_URL") {
+    if let Some(url) = std::env::var("SPOTIFY_CMD_AUTH_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+    {
         rs_config.auth_base_url = url;
     }
     rs_config

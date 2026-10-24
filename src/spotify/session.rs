@@ -68,6 +68,10 @@ impl RefreshFailure {
         if is_network_error(err) {
             return RefreshFailure::Offline;
         }
+        // Sin refresh token no hay forma de renovar: hay que volver a entrar.
+        if matches!(err, ClientError::InvalidToken) {
+            return RefreshFailure::Rejected;
+        }
         match error_response(err) {
             Some(resp) => Self::from_status(resp.status().as_u16(), retry_after(resp)),
             // Una respuesta ilegible no demuestra que la sesión no valga.
@@ -122,6 +126,25 @@ async fn refresh_token_in_memory(sp: &Client) -> Option<String> {
         Ok(token) => token.as_ref().and_then(|t| t.refresh_token.clone()),
         Err(_) => None,
     }
+}
+
+/// Renueva el token conservando el refresh token anterior cuando Spotify no
+/// devuelve uno nuevo (su documentación dice que puede pasar, y rspotify lo
+/// sustituiría por nada, dejando la sesión rota para siempre). Sin refresh
+/// token ni se intenta: rspotify borraría además el token de acceso.
+pub async fn refresh_keeping(sp: &Client) -> rspotify::ClientResult<()> {
+    let Some(previous) = refresh_token_in_memory(sp).await else {
+        return Err(ClientError::InvalidToken);
+    };
+    sp.refresh_token().await?;
+    if let Ok(mut slot) = sp.token.lock().await {
+        match slot.as_mut() {
+            Some(token) if token.refresh_token.is_none() => token.refresh_token = Some(previous),
+            Some(_) => {}
+            None => return Err(ClientError::InvalidToken),
+        }
+    }
+    Ok(())
 }
 
 async fn set_token(sp: &Client, token: rspotify::Token) {
@@ -268,7 +291,7 @@ fn save_in_background(sp: Client, gate: &'static TokenGate, saving: RwLockReadGu
 /// instancia de la app ya lo usara y guardara uno nuevo en `token.json`: en
 /// ese caso se adopta el del disco antes de dar la sesión por perdida.
 async fn refresh_session(sp: &Client) -> Result<(), RefreshFailure> {
-    let failure = match sp.refresh_token().await {
+    let failure = match refresh_keeping(sp).await {
         Ok(()) => return Ok(()),
         Err(e) => RefreshFailure::of(&e),
     };
@@ -293,7 +316,9 @@ async fn adopt_saved_token(sp: &Client) -> Result<(), RefreshFailure> {
     if !expired {
         return Ok(());
     }
-    sp.refresh_token().await.map_err(|e| RefreshFailure::of(&e))
+    refresh_keeping(sp)
+        .await
+        .map_err(|e| RefreshFailure::of(&e))
 }
 
 #[cfg(test)]
@@ -328,8 +353,14 @@ mod tests {
             RefreshFailure::from_status(429, Some(Duration::from_secs(3600))),
             RefreshFailure::Transient(MAX_RETRY_AFTER)
         );
-        // Un error que no es una respuesta de Spotify no demuestra nada.
-        assert_eq!(RefreshFailure::of(&ClientError::InvalidToken), transient);
+        // Una respuesta ilegible no demuestra que la sesión no valga...
+        let unreadable = ClientError::ParseJson(serde_json::from_str::<u8>("x").unwrap_err());
+        assert_eq!(RefreshFailure::of(&unreadable), transient);
+        // ...pero sin refresh token en memoria no hay nada que reintentar.
+        assert_eq!(
+            RefreshFailure::of(&ClientError::InvalidToken),
+            RefreshFailure::Rejected
+        );
 
         assert!(RefreshFailure::Rejected.retry().1.contains("--logout"));
         assert!(!transient.retry().1.contains("--logout"));
@@ -457,6 +488,46 @@ mod tests {
             .unwrap()
             .as_ref()
             .map(|t| t.access_token.clone())
+    }
+
+    /// Spotify puede renovar sin devolver un refresh token nuevo: se conserva
+    /// el anterior (antes se perdía y la sesión quedaba rota para siempre).
+    #[tokio::test]
+    async fn refresh_without_new_refresh_token_keeps_the_old_one() {
+        let body =
+            r#"{"access_token":"renovado","token_type":"Bearer","expires_in":3600,"scope":""}"#;
+        let (url, _requests) = token_server(vec![http_response("200 OK", "", body)]).await;
+        let (sp, dir) = expired_session("refresh_keep", &url).await;
+
+        refresh_keeping(&sp).await.unwrap();
+        assert_eq!(access_token(&sp).await.as_deref(), Some("renovado"));
+        assert_eq!(refresh_token_in_memory(&sp).await.as_deref(), Some("r0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sin refresh token no se intenta renovar (rspotify borraría el token de
+    /// acceso) y la sesión cuenta como rechazada: hay que volver a entrar.
+    #[tokio::test]
+    async fn no_refresh_token_means_login_again() {
+        let (url, requests) = token_server(vec![rejected()]).await;
+        let (sp, dir) = expired_session("refresh_none", &url).await;
+        set_token(
+            &sp,
+            rspotify::Token {
+                refresh_token: None,
+                ..session_token("viejo", "r0", false)
+            },
+        )
+        .await;
+
+        let err = refresh_keeping(&sp).await.unwrap_err();
+        assert_eq!(RefreshFailure::of(&err), RefreshFailure::Rejected);
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no se pidió nada a Spotify"
+        );
+        assert_eq!(access_token(&sp).await.as_deref(), Some("viejo"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Una caída de accounts.spotify.com no da la sesión por perdida: avisa

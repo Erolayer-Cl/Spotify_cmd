@@ -528,7 +528,10 @@ fn draw_search(f: &mut Frame, app: &App, main: Rect) {
             Span::raw(" "),
         ]
     });
-    let block = theme::popup("Buscar", "Tab: tipo · Enter: buscar · Esc: cerrar");
+    let block = theme::popup(
+        "Buscar",
+        "Tab: tipo · Enter: buscar · Ctrl+U: borrar · Esc: cerrar",
+    );
     let inner = block.inner(area);
     // Columnas para el texto: todo menos el indicador y el cursor.
     let room = inner
@@ -539,7 +542,15 @@ fn draw_search(f: &mut Frame, app: &App, main: Rect) {
         Line::from_iter(std::iter::once(Span::raw(" ")).chain(tabs)),
         Line::from(vec![
             Span::styled(SEARCH_PROMPT, theme::strong()),
-            Span::styled(shown, theme::text()),
+            // La búsqueda anterior va atenuada: lo que se escriba la sustituye.
+            Span::styled(
+                shown,
+                if app.search_fresh {
+                    theme::dim()
+                } else {
+                    theme::text()
+                },
+            ),
             Span::styled("█", theme::text()),
         ]),
     ];
@@ -651,7 +662,7 @@ fn draw_devices(f: &mut Frame, app: &mut App) {
 }
 
 /// Filas de la ayuda: un título de sección se marca con descripción vacía.
-const HELP_ROWS: [(&str, &str); 19] = [
+const HELP_ROWS: [(&str, &str); 20] = [
     ("Reproducción", ""),
     ("espacio", "Reproducir / pausar"),
     ("n · p", "Canción siguiente · anterior"),
@@ -668,6 +679,7 @@ const HELP_ROWS: [(&str, &str); 19] = [
     ("a", "Añadir canción a la cola"),
     ("o", "Abrir álbum o playlist de la búsqueda"),
     ("/", "Buscar (Tab cambia: canciones, álbumes…)"),
+    ("Ctrl+U · Ctrl+W", "Buscador: borrar todo · una palabra"),
     ("c", "Ver la carátula en grande"),
     ("R · F5", "Actualizar"),
     ("q · Ctrl+C", "Salir"),

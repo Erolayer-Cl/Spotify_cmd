@@ -35,8 +35,31 @@ impl App {
     // Buscador
     // -----------------------------------------------------------------------
 
+    /// Abre el buscador. La búsqueda anterior queda a la vista (Tab + Enter
+    /// la repite con otro tipo), pero lo primero que se escriba la sustituye.
+    pub(super) fn open_search(&mut self) {
+        self.popup = Popup::Search;
+        self.search_fresh = !self.search_input.is_empty();
+    }
+
+    /// Escribe en el buscador: si aún se muestra la búsqueda anterior, la
+    /// sustituye en lugar de añadirse detrás.
+    fn type_in_search(&mut self, text: &str) {
+        if std::mem::take(&mut self.search_fresh) {
+            self.search_input.clear();
+        }
+        self.search_input.push_str(text);
+    }
+
     /// En el buscador las teclas escriben texto en vez de ejecutar órdenes.
     pub(super) fn on_search_key(&mut self, key: KeyEvent) {
+        // Cualquier tecla de edición (borrar, cambiar de tipo) acepta la
+        // búsqueda anterior como punto de partida.
+        if !matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Esc)
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.search_fresh = false;
+        }
         match key.code {
             KeyCode::Esc => self.close_popup(),
             KeyCode::Enter => {
@@ -58,14 +81,16 @@ impl App {
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 delete_last_word(&mut self.search_input);
             }
-            KeyCode::Char(c) if is_text_input(key.modifiers) => self.search_input.push(c),
+            KeyCode::Char(c) if is_text_input(key.modifiers) => {
+                self.type_in_search(c.encode_utf8(&mut [0; 4]));
+            }
             _ => {}
         }
     }
 
     /// Texto pegado en el buscador.
     pub(super) fn on_search_paste(&mut self, text: &str) {
-        self.search_input.push_str(&pasted_text(text));
+        self.type_in_search(&pasted_text(text));
     }
 
     // -----------------------------------------------------------------------
@@ -202,6 +227,37 @@ mod tests {
 
     fn key_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    /// Al reabrir el buscador, lo que se escribe sustituye a la búsqueda
+    /// anterior (antes quedaba «queenabba»); Tab + Enter la repite.
+    #[tokio::test]
+    async fn reopened_search_replaces_the_old_query() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('/')));
+        for c in "queen".chars() {
+            app.on_event(key(KeyCode::Char(c)));
+        }
+        app.on_event(key(KeyCode::Enter));
+        app.on_event(key(KeyCode::Char('/')));
+        assert!(app.search_fresh, "la búsqueda anterior se ve atenuada");
+        for c in "abba".chars() {
+            app.on_event(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.search_input, "abba");
+
+        // Tab (cambiar de tipo) conserva la búsqueda para repetirla.
+        app.on_event(key(KeyCode::Enter));
+        app.on_event(key(KeyCode::Char('/')));
+        app.on_event(key(KeyCode::Tab));
+        app.on_event(key(KeyCode::Char('s')));
+        assert_eq!(app.search_input, "abbas");
+
+        // Pegar también sustituye.
+        app.on_event(key(KeyCode::Esc));
+        app.on_event(key(KeyCode::Char('/')));
+        app.on_event(Event::Paste("muse".into()));
+        assert_eq!(app.search_input, "muse");
     }
 
     #[tokio::test]

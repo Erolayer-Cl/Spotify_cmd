@@ -74,6 +74,9 @@ impl Action {
                 | Action::Queue(_)
                 | Action::PlayContext { .. }
                 | Action::PlayTracks { .. }
+                // Spotify reordena lo próximo al cambiar el aleatorio o la repetición.
+                | Action::Shuffle(_)
+                | Action::Repeat(_)
         )
     }
 
@@ -183,6 +186,16 @@ mod tests {
                 device_id: "altavoz".into(),
             },
         ] {
+            assert!(!action.changes_track(), "{action:?}");
+        }
+    }
+
+    /// El aleatorio y la repetición reordenan lo próximo (la cola), pero no
+    /// cambian la canción que suena.
+    #[test]
+    fn shuffle_and_repeat_change_the_queue_not_the_track() {
+        for action in [Action::Shuffle(true), Action::Repeat(RepeatState::Context)] {
+            assert!(action.changes_queue(), "{action:?}");
             assert!(!action.changes_track(), "{action:?}");
         }
     }

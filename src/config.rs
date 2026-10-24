@@ -28,6 +28,23 @@ pub struct Config {
     /// Segundos entre cada consulta del estado de reproducción.
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
+    /// Configuración recién escrita por el usuario: se guarda solo cuando el
+    /// inicio de sesión funciona (así un Client ID mal copiado no se queda).
+    #[serde(skip)]
+    pub unsaved: bool,
+}
+
+/// Valor de una variable de entorno, ignorando las vacías (`export X=`).
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Los Client ID de Spotify son 32 caracteres hexadecimales.
+fn looks_like_client_id(id: &str) -> bool {
+    id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn default_redirect_uri() -> String {
@@ -283,26 +300,21 @@ impl Config {
                 .with_context(|| format!("no se pudo leer {}", path.display()))?;
             toml::from_str::<Config>(&raw)
                 .with_context(|| format!("{} no es un TOML válido", path.display()))?
-        } else if let Ok(id) = std::env::var("SPOTIFY_CLIENT_ID") {
+        } else if let Some(id) = env_value("SPOTIFY_CLIENT_ID") {
             Config {
                 client_id: id,
                 redirect_uri: default_redirect_uri(),
                 poll_secs: default_poll_secs(),
+                unsaved: false,
             }
         } else {
-            let config = Self::ask_interactively()?;
-            config.save()?;
-            say!(
-                "{}\n",
-                logo::green(&format!("Configuración guardada en {}", path.display()))
-            );
-            config
+            Self::ask_interactively()?
         };
 
-        if let Ok(id) = std::env::var("SPOTIFY_CLIENT_ID") {
+        if let Some(id) = env_value("SPOTIFY_CLIENT_ID") {
             config.client_id = id;
         }
-        if let Ok(uri) = std::env::var("SPOTIFY_REDIRECT_URI") {
+        if let Some(uri) = env_value("SPOTIFY_REDIRECT_URI") {
             config.redirect_uri = uri;
         }
         config.client_id = config.client_id.trim().to_string();
@@ -329,18 +341,45 @@ impl Config {
         say!("  2. En \"Redirect URIs\" añade exactamente: {DEFAULT_REDIRECT_URI}");
         say!("  3. Marca \"Web API\" y guarda.");
         say!("  4. Copia el \"Client ID\" de la app y pégalo aquí.\n");
-        say_inline!("Client ID: ");
-        let mut id = String::new();
-        io::stdin().read_line(&mut id)?;
-        let id = id.trim().to_string();
-        if id.is_empty() {
-            bail!("no se introdujo ningún Client ID");
-        }
+        let client_id = loop {
+            say_inline!("Client ID: ");
+            let mut id = String::new();
+            if io::stdin().read_line(&mut id)? == 0 {
+                bail!("no se introdujo ningún Client ID");
+            }
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                bail!("no se introdujo ningún Client ID");
+            }
+            if looks_like_client_id(&id) {
+                break id;
+            }
+            say!(
+                "Eso no parece un Client ID (son 32 letras y números, p. ej. 1a2b3c…). \
+                 Cópialo de nuevo desde el panel de tu app."
+            );
+        };
         Ok(Config {
-            client_id: id,
+            client_id,
             redirect_uri: default_redirect_uri(),
             poll_secs: default_poll_secs(),
+            unsaved: true,
         })
+    }
+
+    /// Guarda la configuración escrita en la primera ejecución, una vez que el
+    /// inicio de sesión ha funcionado.
+    pub fn save_if_new(&self) -> Result<()> {
+        if !self.unsaved {
+            return Ok(());
+        }
+        self.save()?;
+        let path = config_path()?;
+        say!(
+            "{}\n",
+            logo::green(&format!("Configuración guardada en {}", path.display()))
+        );
+        Ok(())
     }
 }
 
@@ -377,6 +416,24 @@ mod tests {
             .map(|e| e.unwrap().path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "tmp"))
             .collect()
+    }
+
+    #[test]
+    fn client_ids_are_32_hex_characters() {
+        assert!(looks_like_client_id("0123456789abcdef0123456789ABCDEF"));
+        assert!(!looks_like_client_id("tu_client_id"));
+        assert!(!looks_like_client_id("0123456789abcdef0123456789abcde"));
+        assert!(!looks_like_client_id(
+            "https://developer.spotify.com/dashboard/x"
+        ));
+    }
+
+    #[test]
+    fn unset_environment_variables_are_ignored() {
+        assert_eq!(
+            env_value("SPOTIFY_CMD_TEST_VARIABLE_THAT_DOES_NOT_EXIST"),
+            None
+        );
     }
 
     #[cfg(unix)]

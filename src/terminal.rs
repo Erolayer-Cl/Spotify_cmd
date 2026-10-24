@@ -56,6 +56,7 @@ pub fn ensure_interactive() -> anyhow::Result<()> {
 /// Entra en pantalla completa y modo "raw" (cada tecla llega al instante).
 pub fn init() -> io::Result<DefaultTerminal> {
     install_panic_hook();
+    restore_at_exit();
     enable_raw_mode()?;
     ACTIVE.store(true, Ordering::SeqCst);
     if let Err(e) = execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste) {
@@ -98,11 +99,84 @@ pub fn full_redraw<B: Backend>(tui: &mut Terminal<B>) -> Result<(), B::Error> {
 /// Deja la terminal como estaba. Se puede llamar varias veces sin problema, y
 /// no hace nada si la terminal nunca se preparó.
 pub fn restore() {
+    restore_stderr();
     if !ACTIVE.swap(false, Ordering::SeqCst) {
         return;
     }
     let _ = disable_raw_mode();
     let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+}
+
+/// Si algo termina el proceso con `exit()` desde otro hilo (librespot lo
+/// hace ante algunos fallos internos), la terminal se restaura igual: si no,
+/// quedaría en modo "raw" y sin eco.
+fn restore_at_exit() {
+    #[cfg(unix)]
+    {
+        extern "C" fn at_exit() {
+            let _ = panic::catch_unwind(restore);
+        }
+        static REGISTERED: AtomicBool = AtomicBool::new(false);
+        if !REGISTERED.swap(true, Ordering::SeqCst) {
+            // SAFETY: `at_exit` es una función `extern "C"` sin argumentos
+            // que nunca deja escapar un *panic*.
+            unsafe {
+                libc::atexit(at_exit);
+            }
+        }
+    }
+}
+
+/// Copia de la salida de errores original mientras está desviada (-1: no
+/// lo está).
+#[cfg(unix)]
+static SAVED_STDERR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Mientras la interfaz está abierta, lo que se escriba en la salida de
+/// errores va a `path`: bibliotecas de C como ALSA escriben ahí sus avisos y
+/// en pantalla romperían el dibujo. [`restore`] la devuelve a su sitio.
+#[cfg_attr(not(feature = "local-player"), allow(dead_code))]
+pub fn redirect_stderr(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::create(path)?;
+        // SAFETY: llamadas al sistema sobre descriptores válidos; los
+        // errores se comprueban y no se pierde ninguno abierto.
+        unsafe {
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) < 0 {
+                let err = io::Error::last_os_error();
+                libc::close(saved);
+                return Err(err);
+            }
+            let previous = SAVED_STDERR.swap(saved, Ordering::SeqCst);
+            if previous >= 0 {
+                libc::close(previous);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Devuelve la salida de errores a su sitio si estaba desviada.
+pub fn restore_stderr() {
+    #[cfg(unix)]
+    {
+        let saved = SAVED_STDERR.swap(-1, Ordering::SeqCst);
+        if saved >= 0 {
+            // SAFETY: `saved` es la copia válida que hizo `redirect_stderr`.
+            unsafe {
+                libc::dup2(saved, libc::STDERR_FILENO);
+                libc::close(saved);
+            }
+        }
+    }
 }
 
 /// Los *panics* de código protegido o de tareas en segundo plano no tocan la
@@ -152,5 +226,29 @@ mod tests {
         assert_eq!(err, "dinámico");
         // Tras capturar, el hilo vuelve a estar desprotegido.
         assert!(!GUARDED.with(Cell::get));
+    }
+
+    /// Lo que se escribe en la salida de errores mientras está desviada va
+    /// al archivo, y `restore` la devuelve a su sitio (también sin haber
+    /// preparado la terminal).
+    #[cfg(unix)]
+    #[test]
+    fn stderr_goes_to_the_log_while_redirected() {
+        let path = std::env::temp_dir().join(format!(
+            "spotify_cmd_test_{}_stderr.log",
+            std::process::id()
+        ));
+        let write = |text: &str| {
+            // SAFETY: escribe un búfer válido en el descriptor 2.
+            unsafe { libc::write(libc::STDERR_FILENO, text.as_ptr().cast(), text.len()) };
+        };
+        redirect_stderr(&path).unwrap();
+        write("aviso de ALSA\n");
+        restore();
+        write("");
+        assert_eq!(SAVED_STDERR.load(Ordering::SeqCst), -1);
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("aviso de ALSA"), "{logged:?}");
+        let _ = std::fs::remove_file(&path);
     }
 }

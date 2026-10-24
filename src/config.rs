@@ -28,6 +28,10 @@ pub struct Config {
     /// Segundos entre cada consulta del estado de reproducción.
     #[serde(default = "default_poll_secs")]
     pub poll_secs: u64,
+    /// Si spotify_cmd suena también en este equipo (reproductor local).
+    /// Sin valor, se pregunta la primera vez.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_player: Option<bool>,
     /// Configuración recién escrita por el usuario: se guarda solo cuando el
     /// inicio de sesión funciona (así un Client ID mal copiado no se queda).
     #[serde(skip)]
@@ -318,6 +322,7 @@ impl Config {
                 client_id: id,
                 redirect_uri: default_redirect_uri(),
                 poll_secs: default_poll_secs(),
+                local_player: None,
                 unsaved: false,
             }
         } else {
@@ -344,6 +349,25 @@ impl Config {
     pub fn save(&self) -> Result<()> {
         let path = config_path()?;
         fs::write(&path, toml::to_string_pretty(self)?)
+            .with_context(|| format!("no se pudo escribir {}", path.display()))
+    }
+
+    /// Guarda en `config.toml` si se quiere el reproductor local, sin tocar
+    /// el resto del archivo. Sin archivo (todo viene de variables de
+    /// entorno) no se guarda: se volverá a preguntar.
+    #[cfg_attr(not(feature = "local-player"), allow(dead_code))]
+    pub fn save_local_player(&mut self, enabled: bool) -> Result<()> {
+        self.local_player = Some(enabled);
+        let path = config_path()?;
+        if !path.exists() {
+            return Ok(());
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("no se pudo leer {}", path.display()))?;
+        let mut table: toml::Table = toml::from_str(&raw)
+            .with_context(|| format!("{} no es un TOML válido", path.display()))?;
+        table.insert("local_player".into(), toml::Value::Boolean(enabled));
+        fs::write(&path, toml::to_string_pretty(&table)?)
             .with_context(|| format!("no se pudo escribir {}", path.display()))
     }
 
@@ -376,6 +400,7 @@ impl Config {
             client_id,
             redirect_uri: default_redirect_uri(),
             poll_secs: default_poll_secs(),
+            local_player: None,
             unsaved: true,
         })
     }

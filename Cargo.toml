@@ -24,6 +24,22 @@ toml = "1"
 url = "2"
 webbrowser = "1"
 
+# Reproductor local (librespot): spotify_cmd es también un dispositivo de
+# Spotify Connect que suena en este equipo. En Linux necesita las cabeceras
+# de ALSA para compilar (`sudo apt install libasound2-dev`); sin él:
+# `cargo install --path . --no-default-features`.
+librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "rustls-tls-native-roots"], optional = true }
+librespot-connect = { version = "0.8", default-features = false, features = ["rustls-tls-native-roots"], optional = true }
+cpal = { version = "0.16", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+default = ["local-player"]
+local-player = ["dep:librespot-core", "dep:librespot-playback", "dep:librespot-connect", "dep:cpal"]
+
 [profile.release]
 lto = "thin"
 strip = true

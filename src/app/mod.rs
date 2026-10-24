@@ -43,7 +43,7 @@ use crate::spotify::{Action, Client, DeviceEntry, Playback, PlaylistEntry, Searc
 
 pub use library::{FIXED_LIBRARY, LibraryItem};
 pub use lists::{MainContent, TrackSource};
-pub use messages::{CrashOrigin, Msg};
+pub use messages::{CrashOrigin, LocalDevice, Msg};
 pub use playback::repeat_label;
 pub use tasks::{spawn_blocking_guarded, spawn_guarded};
 
@@ -117,6 +117,8 @@ pub struct App {
     /// Reproducción que falló por no haber dispositivo activo: se repite en
     /// el que se elija en la ventana de dispositivos (abierta para eso).
     pending_play: Option<Action>,
+    /// Este equipo como dispositivo, si el reproductor local está en marcha.
+    pub local_device: Option<LocalDevice>,
 
     pub playlists: Vec<PlaylistEntry>,
     /// Hay una carga de las playlists en curso.
@@ -207,6 +209,7 @@ impl App {
             actions_inflight: 0,
             actions: None,
             pending_play: None,
+            local_device: None,
             playlists: Vec::new(),
             playlists_inflight: false,
             library_state,

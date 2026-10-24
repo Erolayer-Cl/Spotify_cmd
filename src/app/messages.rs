@@ -65,6 +65,17 @@ pub enum Msg {
     },
     /// La sesión no se pudo renovar (token revocado o sin red).
     SessionProblem(String),
+    /// El reproductor local terminó de conectarse (o no pudo).
+    #[cfg_attr(not(feature = "local-player"), allow(dead_code))]
+    LocalPlayer(Result<LocalDevice>),
+}
+
+/// El reproductor local (este equipo como dispositivo de Spotify Connect).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDevice {
+    /// Id del dispositivo en la Web API.
+    pub id: String,
+    pub name: String,
 }
 
 /// Qué tarea sufrió un *panic*: decide qué se da por perdido. Un fallo solo
@@ -104,6 +115,25 @@ impl App {
             Msg::Resized { generation, result } => self.on_resized(generation, result),
             Msg::Crashed { origin, reason } => self.recover_from_crash(origin, &reason),
             Msg::SessionProblem(reason) => self.on_session_problem(reason),
+            Msg::LocalPlayer(result) => self.on_local_player(result),
+        }
+    }
+
+    /// El reproductor local está listo (o no se pudo conectar: la app sigue
+    /// como mando a distancia).
+    fn on_local_player(&mut self, result: Result<LocalDevice>) {
+        match result {
+            Ok(device) => {
+                self.set_status(
+                    format!(
+                        "Este equipo ya suena como «{}»: elígelo con 'd'",
+                        device.name
+                    ),
+                    false,
+                );
+                self.local_device = Some(device);
+            }
+            Err(e) => self.set_status(format!("Reproductor local no disponible: {e:#}"), true),
         }
     }
 

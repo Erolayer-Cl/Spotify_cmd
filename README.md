@@ -22,7 +22,7 @@ Controla Spotify desde la terminal: mira qué suena (con la carátula del álbum
 
 ## Instalar
 
-Necesitas [Rust](https://rustup.rs) y Spotify **Premium** (los controles lo exigen).
+Necesitas [Rust](https://rustup.rs) y Spotify **Premium** (los controles lo exigen). En Linux, además, las cabeceras de ALSA para el reproductor local: `sudo apt install libasound2-dev` (o instala sin él con `cargo install --path . --no-default-features`).
 
 ```bash
 git clone https://github.com/erolayer-cl/spotify_cmd
@@ -37,7 +37,7 @@ cargo install --path .
 3. Copia el **Client ID**.
 4. Ejecuta `spotify_cmd`, pega el Client ID y autoriza en el navegador.
 
-Ten Spotify abierto en algún dispositivo (móvil, PC…): esta herramienta es un mando a distancia.
+La primera vez te pregunta si quieres que **suene en este equipo**: si dices que sí, autorizas su reproductor una vez en el navegador y spotify_cmd aparece como dispositivo de Spotify («spotify_cmd»), sin tener Spotify abierto en ningún otro sitio. Si no, funciona como mando a distancia de tus otros dispositivos (`--no-local-player`, o `local_player = false` en la configuración).
 
 ## Teclas
 

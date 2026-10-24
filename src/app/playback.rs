@@ -275,9 +275,7 @@ impl App {
             Err(e) => {
                 self.note_rate_limit(&e);
                 match replay {
-                    Some(play) if no_active_device(&e) && matches!(self.popup, Popup::None) => {
-                        self.ask_device_for(*play);
-                    }
+                    Some(play) if no_active_device(&e) => self.play_without_device(*play, &e),
                     _ => self.set_status(e.to_string(), true),
                 }
             }
@@ -286,6 +284,29 @@ impl App {
         // La cola visible se recarga sin quitar el foco ni la selección.
         if succeeded && refresh_queue && self.active_library == Some(LibraryItem::Queue) {
             self.schedule_list_reload();
+        }
+    }
+
+    /// La reproducción `play` falló (`err`) por no haber dispositivo activo.
+    /// Con el reproductor local en marcha, suena en este equipo; si no, se
+    /// pide elegir dónde (salvo que haya otra ventana abierta: solo se avisa).
+    fn play_without_device(&mut self, play: Action, err: &anyhow::Error) {
+        let local = self.local_device.as_ref().map(|d| d.id.clone());
+        // Si ya se intentó en este equipo, no se repite: se pide elegir.
+        let already_local = matches!(
+            &play,
+            Action::PlayContext { device_id: Some(id), .. } | Action::PlayTracks { device_id: Some(id), .. }
+                if Some(id) == local.as_ref()
+        );
+        match local {
+            Some(id) if !already_local => {
+                if let Some(here) = play.on_device(id) {
+                    self.set_status("Reproduciendo en este equipo", false);
+                    self.do_action(here);
+                }
+            }
+            _ if matches!(self.popup, Popup::None) => self.ask_device_for(play),
+            _ => self.set_status(err.to_string(), true),
         }
     }
 

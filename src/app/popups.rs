@@ -249,7 +249,7 @@ mod tests {
 
     use super::*;
     use crate::app::tests::{album, crash, key, status, test_app};
-    use crate::app::{CrashOrigin, MainContent};
+    use crate::app::{CrashOrigin, LocalDevice, MainContent};
     use crate::spotify::{ApiError, SearchKind, SearchResults};
 
     fn key_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -491,6 +491,48 @@ mod tests {
             device_choice(None, "altavoz".into()),
             Action::Transfer { device_id } if device_id == "altavoz"
         ));
+    }
+
+    /// Con el reproductor local en marcha, una reproducción sin dispositivo
+    /// activo suena en este equipo sin preguntar; si falla también ahí, se
+    /// pide elegir dónde (sin bucles).
+    #[tokio::test]
+    async fn play_without_device_uses_the_local_player() {
+        let (mut app, _rx) = test_app();
+        app.on_msg(Msg::LocalPlayer(Ok(LocalDevice {
+            id: "equipo".into(),
+            name: "spotify_cmd".into(),
+        })));
+        assert!(status(&app).is_some_and(|s| s.contains("spotify_cmd")));
+        assert!(app.local_device.is_some());
+
+        let no_device = |play: Action| Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            replay: Some(Box::new(play)),
+            result: Err(anyhow::Error::new(ApiError::player(404))),
+        };
+        app.on_msg(no_device(waiting_play()));
+        assert!(matches!(app.popup, Popup::None), "no hace falta preguntar");
+        assert_eq!(app.actions_inflight, 1, "se repite en este equipo");
+        assert_eq!(status(&app), Some("Reproduciendo en este equipo"));
+
+        let on_local = waiting_play().on_device("equipo".into()).unwrap();
+        app.on_msg(no_device(on_local));
+        assert!(
+            matches!(app.popup, Popup::Devices { .. }),
+            "ahora sí se pregunta"
+        );
+    }
+
+    /// Si el reproductor local no se pudo conectar, se avisa y todo sigue
+    /// como mando a distancia.
+    #[tokio::test]
+    async fn local_player_failure_is_only_a_notice() {
+        let (mut app, _rx) = test_app();
+        app.on_msg(Msg::LocalPlayer(Err(anyhow::anyhow!("sin red"))));
+        assert!(app.local_device.is_none());
+        assert!(status(&app).is_some_and(|s| s.contains("no disponible") && s.contains("sin red")));
     }
 
     /// Cerrar la ventana descarta la reproducción pendiente: abrirla después

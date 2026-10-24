@@ -748,6 +748,7 @@ fn search_cursor(inner: Rect, text_width: u16) -> Option<Position> {
 }
 
 fn draw_devices(f: &mut Frame, app: &mut App) {
+    let local_id = app.local_device.as_ref().map(|d| d.id.as_str());
     let Popup::Devices { devices, state } = &mut app.popup else {
         return;
     };
@@ -780,6 +781,9 @@ fn draw_devices(f: &mut Frame, app: &mut App) {
                         Span::styled(d.name.clone(), theme::text()),
                         Span::styled(format!("  ({})", d.kind), theme::dim()),
                     ];
+                    if local_id.is_some() && d.id.as_deref() == local_id {
+                        spans.push(Span::styled("  este equipo", theme::soft()));
+                    }
                     if d.active {
                         spans.push(Span::styled("  ● activo", theme::strong()));
                     }

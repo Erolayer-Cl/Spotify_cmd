@@ -31,6 +31,9 @@ mod app;
 mod auth;
 mod config;
 mod keymap;
+mod local;
+#[cfg(feature = "local-player")]
+mod local_player;
 mod logo;
 mod spotify;
 mod terminal;
@@ -62,13 +65,15 @@ USO:
 OPCIONES:
     --manual-auth   Inicia sesión pegando la URL a mano (útil por SSH)
     --halfblocks    Dibuja la carátula con caracteres (sin protocolo gráfico)
+    --no-local-player
+                    No suena en este equipo: solo controla otros dispositivos
     --logout        Borra el token guardado y sale
     -h, --help      Muestra esta ayuda
     -V, --version   Muestra la versión
 
 CONFIGURACIÓN:
     {config}
-    (client_id, redirect_uri, poll_secs)
+    (client_id, redirect_uri, poll_secs, local_player)
     Variables: SPOTIFY_CLIENT_ID, SPOTIFY_REDIRECT_URI
 
 Dentro de la aplicación pulsa '?' para ver los atajos de teclado.";
@@ -76,17 +81,20 @@ Dentro de la aplicación pulsa '?' para ver los atajos de teclado.";
 struct Args {
     manual_auth: bool,
     halfblocks: bool,
+    no_local_player: bool,
 }
 
 fn parse_args() -> Result<Option<Args>> {
     let mut args = Args {
         manual_auth: false,
         halfblocks: false,
+        no_local_player: false,
     };
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--manual-auth" => args.manual_auth = true,
             "--halfblocks" => args.halfblocks = true,
+            "--no-local-player" => args.no_local_player = true,
             "--logout" => {
                 logout()?;
                 return Ok(None);
@@ -146,12 +154,13 @@ async fn try_main() -> Result<()> {
     terminal::ensure_interactive()?;
 
     say_inline!("{}", logo::banner());
-    let cfg = config::Config::load_or_create()?;
+    let mut cfg = config::Config::load_or_create()?;
     let spotify = auth::authenticate(&cfg, args.manual_auth).await?;
     // La configuración nueva solo se guarda si el inicio de sesión funcionó.
     if let Err(e) = cfg.save_if_new() {
         say_err!("Aviso: no se pudo guardar la configuración ({e:#})");
     }
+    let local = local::prepare(&mut cfg, &args).await;
 
     // A partir de aquí la terminal entra en modo "pantalla completa".
     let tui = terminal::init().context("no se pudo preparar la terminal")?;
@@ -167,7 +176,8 @@ async fn try_main() -> Result<()> {
     };
 
     let mut tui = tui;
-    let result = run(&mut tui, spotify, picker, cfg.poll_secs).await;
+    local.redirect_stderr();
+    let result = run(&mut tui, spotify, picker, cfg.poll_secs, local).await;
     // La terminal se devuelve antes de esperar a la renovación: si tarda (sin
     // red), el usuario ve su consola y un aviso, no una app congelada.
     close_terminal(tui);
@@ -254,6 +264,7 @@ async fn run(
     spotify: spotify::Client,
     picker: Picker,
     poll_secs: u64,
+    local: local::Setup,
 ) -> Result<()> {
     // Área de dibujo actual; `fit_to_window` la ajusta (y limpia la pantalla,
     // también en terminales sin pantalla alternativa) en cada vuelta.
@@ -262,6 +273,7 @@ async fn run(
     let mut app = App::new(spotify, picker, resize_tx, poll_secs);
     let msg_tx = app.sender();
     protected(&mut app, App::start);
+    let local = local.start(app.sender());
 
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -332,6 +344,7 @@ async fn run(
         let _ = terminal::guard(|| tui.draw(|f| ui::draw(f, &mut app)).map(drop));
         finish_actions(&mut app, ACTIONS_GRACE).await;
     }
+    local.shutdown().await;
     Ok(())
 }
 

@@ -96,6 +96,33 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     Ok(spotify)
 }
 
+/// Token de acceso con el permiso `streaming` para el reproductor local
+/// (librespot), del Client ID `client_id`. Solo se pide la primera vez:
+/// después librespot guarda sus propias credenciales.
+#[cfg(feature = "local-player")]
+pub async fn streaming_token(client_id: &str, redirect_uri: &str, manual: bool) -> Result<String> {
+    let oauth = OAuth {
+        redirect_uri: redirect_uri.into(),
+        scopes: scopes!("streaming"),
+        ..Default::default()
+    };
+    let creds = Credentials::new_pkce(client_id);
+    let mut spotify =
+        AuthCodePkceSpotify::with_config(creds, oauth, client_config(Default::default()));
+    let intro = "Autoriza ahora el reproductor de spotify_cmd (solo esta vez).";
+    let hint = "¿Ya aceptaste y no pasa nada? Sal con Ctrl+C y vuelve a intentarlo, o usa \
+                `spotify_cmd --no-local-player` para seguir sin el reproductor local.";
+    let code = browser_code(&mut spotify, manual, intro, hint).await?;
+    spotify
+        .request_token(&code)
+        .await
+        .context("Spotify rechazó el código de autorización del reproductor")?;
+    let token = spotify.token.lock().await.ok().and_then(|t| t.clone());
+    let token = token.context("Spotify no devolvió un token para el reproductor")?;
+    say!("{}", logo::green("¡Reproductor local autorizado!"));
+    Ok(token.access_token)
+}
+
 /// Pide al usuario que autorice en el navegador y devuelve el código de
 /// autorización: lo recoge la redirección a esta máquina o, en modo manual
 /// (o si no se puede escuchar), la URL que el usuario pega. `intro` explica

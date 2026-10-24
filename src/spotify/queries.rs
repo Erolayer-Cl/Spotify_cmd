@@ -18,7 +18,8 @@ use super::Client;
 use super::errors::{Friendly, Kind, friendly};
 use super::models::{
     ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackEntry,
-    artist_names, millis, playable_entry, playback_from_context, playlist_entry, track_entry,
+    TrackList, artist_names, millis, playable_entry, playback_from_context, playlist_entry,
+    track_entry,
 };
 
 /// Límite de resultados por búsqueda. Las apps en "Development mode" de
@@ -62,19 +63,29 @@ where
     Ok(std::iter::once((0, first)).chain(rest).collect())
 }
 
-/// Como [`fetch_pages`], pero solo los elementos, en orden.
-async fn fetch_paged<T, F, Fut>(max_items: u32, fetch_page: F) -> Result<Vec<T>>
+/// Como [`fetch_pages`], pero solo los elementos, en orden, y el total de
+/// la lista en Spotify (que puede pasar de `max_items`).
+async fn fetch_paged<T, F, Fut>(max_items: u32, fetch_page: F) -> Result<(Vec<T>, usize)>
 where
     F: Fn(u32) -> Fut,
     Fut: Future<Output = Result<Page<T>>>,
     T: serde::de::DeserializeOwned,
 {
     let pages = fetch_pages(max_items, fetch_page).await?;
-    Ok(pages
+    let total = list_total(&pages);
+    let items = pages
         .into_iter()
         .flat_map(|(_, page)| page.items)
         .take(max_items as usize)
-        .collect())
+        .collect();
+    Ok((items, total))
+}
+
+/// Total de elementos de la lista según su primera página.
+fn list_total<T: serde::de::DeserializeOwned>(pages: &[(u32, Page<T>)]) -> usize {
+    pages.first().map_or(0, |(_, page)| {
+        usize::try_from(page.total).unwrap_or(usize::MAX)
+    })
 }
 
 /// Los elementos de las páginas con su posición real en la lista. Spotify
@@ -99,7 +110,7 @@ where
 }
 
 pub async fn playlists(sp: &Client) -> Result<Vec<PlaylistEntry>> {
-    let items = fetch_paged(MAX_PLAYLISTS, |offset| async move {
+    let (items, _) = fetch_paged(MAX_PLAYLISTS, |offset| async move {
         sp.current_user_playlists_manual(Some(PAGE_SIZE), Some(offset))
             .await
             .friendly()
@@ -108,7 +119,7 @@ pub async fn playlists(sp: &Client) -> Result<Vec<PlaylistEntry>> {
     Ok(items.into_iter().map(playlist_entry).collect())
 }
 
-pub async fn playlist_tracks(sp: &Client, id: PlaylistId<'static>) -> Result<Vec<TrackEntry>> {
+pub async fn playlist_tracks(sp: &Client, id: PlaylistId<'static>) -> Result<TrackList> {
     let id = &id;
     let pages = fetch_pages(MAX_PLAYLIST_TRACKS, |offset| async move {
         sp.playlist_items_manual(
@@ -122,14 +133,16 @@ pub async fn playlist_tracks(sp: &Client, id: PlaylistId<'static>) -> Result<Vec
         .map_err(|e| friendly(e, Kind::PlaylistItems))
     })
     .await?;
+    let total = list_total(&pages);
     // La posición se calcula antes de descartar los elementos ilegibles.
-    Ok(with_positions(pages, MAX_PLAYLIST_TRACKS)
+    let tracks = with_positions(pages, MAX_PLAYLIST_TRACKS)
         .into_iter()
         .filter_map(|(position, i)| {
             let entry = i.item.as_ref().and_then(playable_entry)?;
             Some(TrackEntry { position, ..entry })
         })
-        .collect())
+        .collect();
+    Ok(TrackList { tracks, total })
 }
 
 pub async fn album_tracks(
@@ -157,14 +170,15 @@ pub async fn album_tracks(
 }
 
 /// Canciones guardadas ("Tus me gusta"), las más recientes primero.
-pub async fn saved_tracks(sp: &Client) -> Result<Vec<TrackEntry>> {
-    let items = fetch_paged(MAX_SAVED_TRACKS, |offset| async move {
+pub async fn saved_tracks(sp: &Client) -> Result<TrackList> {
+    let (items, total) = fetch_paged(MAX_SAVED_TRACKS, |offset| async move {
         sp.current_user_saved_tracks_manual(Some(Market::FromToken), Some(PAGE_SIZE), Some(offset))
             .await
             .friendly()
     })
     .await?;
-    Ok(items.iter().map(|s| track_entry(&s.track)).collect())
+    let tracks = items.iter().map(|s| track_entry(&s.track)).collect();
+    Ok(TrackList { tracks, total })
 }
 
 pub async fn recently_played(sp: &Client) -> Result<Vec<TrackEntry>> {
@@ -307,13 +321,14 @@ mod tests {
     #[tokio::test]
     async fn fetch_paged_keeps_order_and_limits() {
         let all = fetch_paged(1000, |o| fake_page(o, 237)).await.unwrap();
-        assert_eq!(all, (0..237).collect::<Vec<_>>());
+        assert_eq!(all, ((0..237).collect::<Vec<_>>(), 237));
 
+        // Con tope se cargan solo las primeras, pero se sabe cuántas hay.
         let capped = fetch_paged(120, |o| fake_page(o, 5000)).await.unwrap();
-        assert_eq!(capped, (0..120).collect::<Vec<_>>());
+        assert_eq!(capped, ((0..120).collect::<Vec<_>>(), 5000));
 
         let empty = fetch_paged(1000, |o| fake_page(o, 0)).await.unwrap();
-        assert!(empty.is_empty());
+        assert_eq!(empty, (Vec::new(), 0));
     }
 
     #[tokio::test]

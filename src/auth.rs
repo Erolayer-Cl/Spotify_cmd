@@ -83,11 +83,34 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     }
 
     // 2. Flujo completo en el navegador.
+    let hint = redirect_hint(&spotify.oauth.redirect_uri);
+    let intro = "Inicia sesión en Spotify para autorizar spotify_cmd.";
+    let code = browser_code(&mut spotify, manual, intro, &hint).await?;
+
+    spotify
+        .request_token(&code)
+        .await
+        .context("Spotify rechazó el código de autorización")?;
+    save_session_or_warn(&spotify).await;
+    say!("{}", logo::green("¡Sesión iniciada!"));
+    Ok(spotify)
+}
+
+/// Pide al usuario que autorice en el navegador y devuelve el código de
+/// autorización: lo recoge la redirección a esta máquina o, en modo manual
+/// (o si no se puede escuchar), la URL que el usuario pega. `intro` explica
+/// para qué es; `hint`, qué revisar si la redirección no llega.
+async fn browser_code(
+    spotify: &mut AuthCodePkceSpotify,
+    manual: bool,
+    intro: &str,
+    hint: &str,
+) -> Result<String> {
     let url = spotify
         .get_authorize_url(None)
         .context("no se pudo generar la URL de autorización")?;
 
-    say!("Inicia sesión en Spotify para autorizar spotify_cmd.\n");
+    say!("{intro}\n");
     say!(
         "Si el navegador no se abre solo, visita esta URL:\n\n  {}\n",
         logo::green(&url)
@@ -103,18 +126,17 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     if !manual {
         let _ = webbrowser::open(&url);
     }
-    let code = match listener {
+    match listener {
         Some(listener) => {
             let addr = listener
                 .local_addr()
                 .map_or_else(|_| "127.0.0.1".to_string(), |a| a.to_string());
             say!("Esperando la redirección en http://{addr} ... (Ctrl+C para cancelar)");
             let state = spotify.oauth.state.clone();
-            let hint = redirect_hint(&spotify.oauth.redirect_uri);
             wait_with_hint(wait_for_code(listener, state), HINT_AFTER, || {
                 say!("\n{hint}")
             })
-            .await?
+            .await
         }
         None => {
             say!("Tras aceptar, el navegador te llevará a una página que puede no cargar.");
@@ -123,17 +145,9 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
             io::stdin().read_line(&mut input)?;
             spotify
                 .parse_response_code(input.trim())
-                .context("la URL pegada no contiene un código válido")?
+                .context("la URL pegada no contiene un código válido")
         }
-    };
-
-    spotify
-        .request_token(&code)
-        .await
-        .context("Spotify rechazó el código de autorización")?;
-    save_session_or_warn(&spotify).await;
-    say!("{}", logo::green("¡Sesión iniciada!"));
-    Ok(spotify)
+    }
 }
 
 /// Configuración de rspotify. La caché del token (`token.json`) la gestiona la

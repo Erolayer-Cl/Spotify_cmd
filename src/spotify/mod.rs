@@ -26,6 +26,7 @@ pub use actions::{Action, ContextStart, perform};
 pub use errors::ApiError;
 pub use models::{
     ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackEntry,
+    TrackList,
 };
 pub use queries::{
     album_tracks, devices, download_image, playback, playlist_tracks, playlists, queue,

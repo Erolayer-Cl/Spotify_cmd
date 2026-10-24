@@ -3,6 +3,8 @@
 //! Generado con medios bloques (`▀ ▄ █`): cada carácter dibuja dos "píxeles"
 //! en vertical, así el círculo sale redondo aunque las celdas sean altas.
 
+use crate::theme;
+
 /// Versión compacta: 9 filas × 18 columnas.
 pub const LOGO_SMALL: [&str; 9] = [
     "    ▄▄██████▄▄    ",
@@ -35,25 +37,35 @@ pub const LOGO_LARGE: [&str; 15] = [
     "        ▀▀▀████████▀▀▀        ",
 ];
 
-const ANSI_GREEN: &str = "\x1b[38;2;30;215;96m";
 const ANSI_BOLD: &str = "\x1b[1m";
 const ANSI_RESET: &str = "\x1b[0m";
 
+/// Secuencia del verde de la app: de 24 bits o, si la terminal no los
+/// muestra, el más parecido de la paleta de 256 (ver [`theme::truecolor`]).
+fn ansi_green() -> &'static str {
+    if theme::truecolor() {
+        "\x1b[38;2;30;215;96m"
+    } else {
+        "\x1b[38;5;41m"
+    }
+}
+
 /// Cabecera verde que se imprime en la terminal al arrancar.
 pub fn banner() -> String {
+    let green = ansi_green();
     let mut out = String::new();
     for row in LOGO_LARGE {
-        out.push_str(&format!("  {ANSI_GREEN}{row}{ANSI_RESET}\n"));
+        out.push_str(&format!("  {green}{row}{ANSI_RESET}\n"));
     }
     out.push_str(&format!(
-        "\n  {ANSI_GREEN}{ANSI_BOLD}spotify_cmd{ANSI_RESET} {ANSI_GREEN}· Spotify en tu terminal{ANSI_RESET}\n"
+        "\n  {green}{ANSI_BOLD}spotify_cmd{ANSI_RESET} {green}· Spotify en tu terminal{ANSI_RESET}\n"
     ));
     out
 }
 
 /// Escribe un texto en verde (para los mensajes fuera de la interfaz).
 pub fn green(text: &str) -> String {
-    format!("{ANSI_GREEN}{text}{ANSI_RESET}")
+    format!("{}{text}{ANSI_RESET}", ansi_green())
 }
 
 #[cfg(test)]

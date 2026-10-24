@@ -45,6 +45,22 @@ impl Playback {
     }
 }
 
+/// Canciones cargadas de una lista y cuántas tiene en Spotify: las listas
+/// enormes se cargan solo en parte (para que abran rápido), y así se avisa.
+#[derive(Debug, Clone, Default)]
+pub struct TrackList {
+    pub tracks: Vec<TrackEntry>,
+    pub total: usize,
+}
+
+/// Una lista cargada entera.
+impl From<Vec<TrackEntry>> for TrackList {
+    fn from(tracks: Vec<TrackEntry>) -> Self {
+        let total = tracks.len();
+        TrackList { tracks, total }
+    }
+}
+
 /// Canción (o episodio) mostrada en una lista.
 #[derive(Debug, Clone)]
 pub struct TrackEntry {

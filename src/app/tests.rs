@@ -17,7 +17,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use super::{App, CrashOrigin, Msg};
 use crate::spotify::{
     Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults,
-    TrackEntry,
+    TrackEntry, TrackList,
 };
 
 /// Id de una canción de prueba.
@@ -134,7 +134,7 @@ pub fn now_playing(title: &str, is_playing: bool) -> Playback {
 pub(super) fn deliver(app: &mut App, tracks: Vec<TrackEntry>) {
     app.on_msg(Msg::Tracks {
         request: app.request_id,
-        result: Ok(tracks),
+        result: Ok(tracks.into()),
     });
 }
 
@@ -213,18 +213,22 @@ fn random_msg(rng: &mut Lcg, app: &App) -> Msg {
         },
         3 => Msg::Tracks {
             request,
-            result: Ok(Vec::new()),
+            result: Ok(TrackList::default()),
         },
         // Filas reales: moverse, reproducir, encolar y seguir la selección.
         4 => Msg::Tracks {
             request,
-            result: Ok((0..rng.next() % 40)
-                .map(|i| match i % 3 {
-                    0 => song("Local"),
-                    1 => track("A", ID_A, Some(i as u32)),
-                    _ => track("B", ID_B, None),
-                })
-                .collect()),
+            result: Ok(TrackList {
+                tracks: (0..rng.next() % 40)
+                    .map(|i| match i % 3 {
+                        0 => song("Local"),
+                        1 => track("A", ID_A, Some(i as u32)),
+                        _ => track("B", ID_B, None),
+                    })
+                    .collect(),
+                // A veces es solo una parte de una lista más larga.
+                total: rng.next() % 80,
+            }),
         },
         5 => Msg::Tracks {
             request,

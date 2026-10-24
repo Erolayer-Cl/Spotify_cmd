@@ -156,6 +156,11 @@ pub struct App {
     /// Veces seguidas que se ha vuelto a preparar la carátula actual (vuelve
     /// a 0 cuando un redimensionado sale bien).
     cover_rebuilds: u8,
+    /// Con Kitty, la carátula se envía a la terminal una sola vez, dentro de
+    /// su primera celda: si se envió con una ventana abierta encima, la
+    /// ventana pudo tapar esa celda y la imagen no llegó. Al cerrarla se
+    /// vuelve a enviar.
+    cover_sent_under_popup: bool,
     /// Cambia cada vez que se sustituye (o se quita) la carátula preparada:
     /// identifica los redimensionados ya obsoletos.
     cover_generation: u64,
@@ -222,6 +227,7 @@ impl App {
             cover_url: None,
             cover_image: None,
             cover_rebuilds: 0,
+            cover_sent_under_popup: false,
             cover_generation: 0,
             cover_retry_at: None,
             status: None,

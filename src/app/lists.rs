@@ -12,7 +12,9 @@ use rspotify::model::PlaylistId;
 use rspotify::prelude::*;
 
 use super::{App, Focus, Msg};
-use crate::spotify::{self, ApiError, Client, ContextEntry, SearchKind, SearchResults, TrackEntry};
+use crate::spotify::{
+    self, ApiError, Client, ContextEntry, SearchKind, SearchResults, TrackEntry, TrackList,
+};
 
 /// Cómo reproducir las canciones de la lista mostrada.
 #[derive(Debug, Clone)]
@@ -39,6 +41,9 @@ pub enum MainContent {
         title: String,
         source: TrackSource,
         tracks: Vec<TrackEntry>,
+        /// Canciones de la lista en Spotify: más que `tracks` si solo se
+        /// cargó una parte (ver los límites de `spotify::queries`).
+        total: usize,
     },
     Contexts {
         title: String,
@@ -158,7 +163,7 @@ impl App {
         fetch: F,
     ) where
         F: FnOnce(Client) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<Vec<TrackEntry>>> + Send + 'static,
+        Fut: Future<Output = Result<TrackList>> + Send + 'static,
     {
         let request = self.next_request(title, source, mode);
         self.spawn_list(fetch, move |result| Msg::Tracks { request, result });
@@ -186,7 +191,9 @@ impl App {
                 self.show_list();
                 let name = entry.name.clone();
                 self.load_tracks(entry.name, source, LoadMode::Open, move |sp| async move {
-                    spotify::album_tracks(&sp, id, &name).await
+                    spotify::album_tracks(&sp, id, &name)
+                        .await
+                        .map(TrackList::from)
                 });
             }
             _ => self.set_status("Los artistas solo se pueden reproducir (Enter)", false),
@@ -224,7 +231,7 @@ impl App {
     // -----------------------------------------------------------------------
 
     /// Respuesta de la carga de una lista de canciones.
-    pub(super) fn on_tracks(&mut self, request: u64, result: Result<Vec<TrackEntry>>) {
+    pub(super) fn on_tracks(&mut self, request: u64, result: Result<TrackList>) {
         if !self.is_current_list(request) {
             return;
         }
@@ -253,6 +260,7 @@ impl App {
                 MainContent::Tracks {
                     title,
                     source: TrackSource::Uris,
+                    total: tracks.len(),
                     tracks,
                 }
             }
@@ -275,7 +283,7 @@ impl App {
         }
     }
 
-    fn show_tracks(&mut self, pending: PendingList, result: Result<Vec<TrackEntry>>) {
+    fn show_tracks(&mut self, pending: PendingList, result: Result<TrackList>) {
         let PendingList {
             title,
             source,
@@ -289,10 +297,10 @@ impl App {
                 return;
             }
             Err(e) => load_error(title, source, &e),
-            Ok(tracks) if tracks.is_empty() => {
+            Ok(list) if list.tracks.is_empty() => {
                 MainContent::Message(format!("«{title}» está vacía."))
             }
-            Ok(tracks) => {
+            Ok(TrackList { tracks, total }) => {
                 // Al recargar (la cola tras un salto, las recientes...) la
                 // selección sigue a la canción, no al número de fila.
                 let row = if reload {
@@ -304,6 +312,7 @@ impl App {
                 MainContent::Tracks {
                     title,
                     source,
+                    total: total.max(tracks.len()),
                     tracks,
                 }
             }
@@ -421,7 +430,8 @@ mod tests {
                 duration_ms: 294_000,
                 id: None,
                 position: None,
-            }]),
+            }]
+            .into()),
         });
         match &app.main {
             MainContent::Tracks { title, source, .. } => {

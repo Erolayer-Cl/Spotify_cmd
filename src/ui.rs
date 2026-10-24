@@ -23,14 +23,24 @@ use crate::theme;
 
 /// Alto del panel "Reproduciendo" (borde incluido).
 const PLAYER_HEIGHT: u16 = 11;
+/// Alto mínimo de la biblioteca y la lista.
+const MIN_BODY_HEIGHT: u16 = 8;
 /// Tamaño máximo de la carátula grande (en filas; el ancho es el doble).
 const MAX_COVER_ROWS: u16 = 60;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    // Un aviso que no cabe en una fila (p. ej. cómo recuperar la sesión a
+    // 80 columnas) ocupa dos, para que se lea entero, si sobra sitio: en
+    // una ventana baja, la fila de más se la quitaría al reproductor.
+    let footer_text = footer_line(app);
+    let area = f.area();
+    let wide = footer_text.width() > usize::from(area.width);
+    let room = area.height >= MIN_BODY_HEIGHT + PLAYER_HEIGHT + 2;
+    let footer_rows = if wide && room && is_notice(app) { 2 } else { 1 };
     let [body, player, footer] = Layout::vertical([
-        Constraint::Min(8),
+        Constraint::Min(MIN_BODY_HEIGHT),
         Constraint::Length(PLAYER_HEIGHT),
-        Constraint::Length(1),
+        Constraint::Length(footer_rows),
     ])
     .areas(f.area());
     let [library, main] =
@@ -43,7 +53,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_main(f, app, main);
     }
     draw_player(f, app, player);
-    draw_footer(f, app, footer);
+    f.render_widget(
+        Paragraph::new(footer_text).wrap(Wrap { trim: false }),
+        footer,
+    );
 
     match &app.popup {
         Popup::Search => draw_search(f, app, main),
@@ -51,6 +64,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Popup::Help => draw_help(f),
         Popup::None => {}
     }
+    theme::finish_frame(f.buffer_mut());
 }
 
 // ---------------------------------------------------------------------------
@@ -99,15 +113,20 @@ fn to_u16(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }
 
+/// Si el logo `rows` cabe entero en `width` × `height` celdas.
+fn fits(rows: &[&str], width: u16, height: u16) -> bool {
+    let logo_width = rows.first().map_or(0, |row| row.cell_width());
+    logo_width <= width && to_u16(rows.len()) <= height
+}
+
 /// El logo más grande que cabe en `area` junto a un mensaje de `text_rows`
 /// filas, con las filas que ocupa (separación incluida). `None` si no cabe
 /// ninguno: el mensaje tiene prioridad.
 fn logo_that_fits(area: Rect, text_rows: u16) -> Option<(&'static [&'static str], u16)> {
     LOGO_CHOICES.into_iter().find_map(|(logo, gap)| {
         let rows = to_u16(logo.len()).saturating_add(gap);
-        let width = logo.first().map_or(0, |row| row.cell_width());
-        let fits = rows.saturating_add(text_rows) <= area.height && width <= area.width;
-        fits.then_some((logo, rows))
+        let room = area.height.saturating_sub(text_rows).saturating_sub(gap);
+        fits(logo, area.width, room).then_some((logo, rows))
     })
 }
 
@@ -155,8 +174,51 @@ fn styled_table<'a>(
         .highlight_symbol("▌")
 }
 
-fn render_table(f: &mut Frame, table: Table, area: Rect, state: &mut TableState) {
-    f.render_stateful_widget(table, area, state);
+/// Dibuja en `area` la tabla de `items`, construyendo solo las filas que se
+/// ven: una lista de 2000 canciones costaba ~2,5 ms por fotograma en filas
+/// que no se dibujaban. `make_row` recibe el índice real de cada elemento y
+/// `table` arma la tabla con esas filas. La ventana sigue a la selección
+/// como lo haría ratatui, y su inicio se guarda en `state`.
+fn render_table<'a, T>(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut TableState,
+    items: &'a [T],
+    make_row: impl Fn(usize, &'a T) -> Row<'a>,
+    table: impl FnOnce(Vec<Row<'a>>) -> Table<'a>,
+) {
+    // Bordes (2), cabecera y su separación (2).
+    let visible = usize::from(area.height.saturating_sub(4)).max(1);
+    let selected = state.selected().filter(|&i| i < items.len());
+    let (start, end) = visible_window(items.len(), visible, state.offset(), selected);
+    let rows = items[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, item)| make_row(start + i, item))
+        .collect();
+    let mut window = TableState::default().with_selected(selected.map(|i| i - start));
+    f.render_stateful_widget(table(rows), area, &mut window);
+    *state.offset_mut() = start;
+}
+
+/// Ventana `[start, end)` de como mucho `visible` de `len` filas, que parte
+/// del desplazamiento anterior `offset` y se mueve lo justo para contener la
+/// fila seleccionada.
+fn visible_window(
+    len: usize,
+    visible: usize,
+    offset: usize,
+    selected: Option<usize>,
+) -> (usize, usize) {
+    let mut start = offset.min(len.saturating_sub(1));
+    if let Some(selected) = selected {
+        if selected < start {
+            start = selected;
+        } else if selected >= start + visible {
+            start = selected + 1 - visible;
+        }
+    }
+    (start, (start + visible).min(len))
 }
 
 // ---------------------------------------------------------------------------
@@ -241,12 +303,12 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(block, area);
             draw_logo_message(f, inner, text);
         }
-        MainContent::Tracks { title, tracks, .. } => {
-            let rows = tracks
-                .iter()
-                .enumerate()
-                .map(|(i, t)| track_row(i, t, is_current_track(t, current_id)))
-                .collect();
+        MainContent::Tracks {
+            title,
+            tracks,
+            total,
+            ..
+        } => {
             let widths = [
                 Constraint::Length(4),
                 Constraint::Percentage(38),
@@ -255,35 +317,43 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Length(7),
             ];
             let header = ["#", "Título", "Artista", "Álbum", "Dur."];
-            let title = format!(" {title} · {} ", tracks.len());
-            let table = styled_table(rows, &widths, &header, title, focused);
-            render_table(f, table, area, &mut app.main_state);
+            // Si solo se cargó una parte de la lista, se dice: «1000 de 5000».
+            let title = if *total > tracks.len() {
+                format!(" {title} · {} de {total} ", tracks.len())
+            } else {
+                format!(" {title} · {} ", tracks.len())
+            };
+            render_table(
+                f,
+                area,
+                &mut app.main_state,
+                tracks,
+                |i, t| track_row(i, t, is_current_track(t, current_id)),
+                |rows| styled_table(rows, &widths, &header, title, focused),
+            );
         }
         MainContent::Contexts { title, kind, items } => {
             let icon = search_icon(*kind);
-            let rows = items
-                .iter()
-                .map(|c| {
-                    Row::new(vec![
-                        Cell::from(icon).style(theme::text()),
-                        Cell::from(c.name.as_str()),
-                        Cell::from(c.detail.as_str()).style(theme::dim()),
-                    ])
-                })
-                .collect();
             let widths = [
                 Constraint::Length(2),
                 Constraint::Percentage(50),
                 Constraint::Percentage(50),
             ];
-            let table = styled_table(
-                rows,
-                &widths,
-                &["", "Nombre", "Detalle"],
-                format!(" {title} "),
-                focused,
+            let title = format!(" {title} ");
+            render_table(
+                f,
+                area,
+                &mut app.main_state,
+                items,
+                |_, c| {
+                    Row::new(vec![
+                        Cell::from(icon).style(theme::text()),
+                        Cell::from(c.name.as_str()),
+                        Cell::from(c.detail.as_str()).style(theme::dim()),
+                    ])
+                },
+                |rows| styled_table(rows, &widths, &["", "Nombre", "Detalle"], title, focused),
             );
-            render_table(f, table, area, &mut app.main_state);
         }
     }
 }
@@ -344,10 +414,16 @@ fn draw_player(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         // Las celdas de la terminal son ~el doble de altas que anchas: un
         // cuadrado de N filas ocupa ~2N columnas.
-        let cover_w = (inner.height * 2).min(inner.width / 3);
+        let mut cover_w = (inner.height * 2).min(inner.width / 3);
+        // Sin carátula va el logo, y solo entero: si no cabe, el hueco es
+        // para el texto.
+        if !app.has_cover() && !fits(&LOGO_SMALL, cover_w, inner.height) {
+            cover_w = 0;
+        }
+        let gap = if cover_w > 0 { 2 } else { 1 };
         let [cover, _gap, info] = Layout::horizontal([
             Constraint::Length(cover_w),
-            Constraint::Length(2),
+            Constraint::Length(gap),
             Constraint::Min(10),
         ])
         .areas(inner);
@@ -391,7 +467,7 @@ fn draw_now_playing(f: &mut Frame, pb: &Playback, area: Rect) {
         Line::styled(pb.artists.clone(), theme::text()),
         Line::styled(pb.album.clone(), theme::soft().italic()),
         Line::raw(""),
-        status_line(pb),
+        status_line(pb, area.width),
         Line::styled(
             format!("Dispositivo: {} ({})", pb.device_name, pb.device_type),
             theme::dim(),
@@ -401,31 +477,82 @@ fn draw_now_playing(f: &mut Frame, pb: &Playback, area: Rect) {
     f.render_widget(progress_bar(pb), gauge_area);
 }
 
-/// "▶ Reproduciendo   ⇄ Aleatorio: sí   ↻ Repetir: lista   Vol 65%".
-fn status_line(pb: &Playback) -> Line<'static> {
-    let state = if pb.is_playing {
-        Span::styled("▶ Reproduciendo", theme::strong())
-    } else {
-        Span::styled("⏸ En pausa", theme::warning())
-    };
-    let gap = || Span::raw("   ");
-    let mut spans = vec![
-        state,
-        gap(),
-        Span::styled(
-            format!("⇄ Aleatorio: {}", if pb.shuffle { "sí" } else { "no" }),
-            theme::toggle(pb.shuffle),
-        ),
-        gap(),
-        Span::styled(
-            format!("↻ Repetir: {}", repeat_label(pb.repeat)),
-            theme::toggle(pb.repeat != RepeatState::Off),
-        ),
+/// "▶ Reproduciendo   ⇄ Aleatorio: sí   ↻ Repetir: lista   Vol 65%", o
+/// una versión más corta si no cabe en `width` columnas (así el volumen
+/// siempre se ve, también a 80 columnas).
+fn status_line(pb: &Playback, width: u16) -> Line<'static> {
+    let shuffle = if pb.shuffle { "sí" } else { "no" };
+    let repeat = repeat_label(pb.repeat);
+    let volume = pb.volume.map(|v| format!("{v}%"));
+    // Del más explicado al más compacto.
+    let variants = [
+        StatusText {
+            state: if pb.is_playing {
+                "▶ Reproduciendo"
+            } else {
+                "⏸ En pausa"
+            },
+            shuffle: format!("⇄ Aleatorio: {shuffle}"),
+            repeat: format!("↻ Repetir: {repeat}"),
+            volume: volume.as_ref().map(|v| format!("Vol {v}")),
+            gap: "   ",
+        },
+        StatusText {
+            state: if pb.is_playing {
+                "▶ Sonando"
+            } else {
+                "⏸ Pausa"
+            },
+            shuffle: format!("⇄ {shuffle}"),
+            repeat: format!("↻ {repeat}"),
+            volume: volume.as_ref().map(|v| format!("Vol {v}")),
+            gap: "  ",
+        },
+        StatusText {
+            state: if pb.is_playing { "▶" } else { "⏸" },
+            shuffle: format!("⇄ {shuffle}"),
+            repeat: format!("↻ {repeat}"),
+            volume,
+            gap: " ",
+        },
     ];
-    if let Some(volume) = pb.volume {
-        spans.extend([gap(), Span::styled(format!("Vol {volume}%"), theme::soft())]);
+    let lines = variants.map(|text| text.line(pb));
+    let compact = lines.len() - 1;
+    let chosen = lines
+        .iter()
+        .position(|line| line.width() <= usize::from(width))
+        .unwrap_or(compact);
+    lines.into_iter().nth(chosen).unwrap_or_default()
+}
+
+/// Textos de una versión de la línea de estado del reproductor.
+struct StatusText {
+    state: &'static str,
+    shuffle: String,
+    repeat: String,
+    volume: Option<String>,
+    gap: &'static str,
+}
+
+impl StatusText {
+    fn line(self, pb: &Playback) -> Line<'static> {
+        let state_style = if pb.is_playing {
+            theme::strong()
+        } else {
+            theme::warning()
+        };
+        let mut spans = vec![
+            Span::styled(self.state, state_style),
+            Span::raw(self.gap),
+            Span::styled(self.shuffle, theme::toggle(pb.shuffle)),
+            Span::raw(self.gap),
+            Span::styled(self.repeat, theme::toggle(pb.repeat != RepeatState::Off)),
+        ];
+        if let Some(volume) = self.volume {
+            spans.extend([Span::raw(self.gap), Span::styled(volume, theme::soft())]);
+        }
+        Line::from(spans)
     }
-    Line::from(spans)
 }
 
 fn progress_bar(pb: &Playback) -> LineGauge<'static> {
@@ -452,10 +579,12 @@ fn draw_cover(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     if !app.has_cover() {
-        // Sin carátula (cargando o nada sonando): el logo de Spotify.
-        let logo = Paragraph::new(logo_lines(&LOGO_SMALL)).alignment(Alignment::Center);
-        let height = (LOGO_SMALL.len() as u16).min(area.height);
-        f.render_widget(logo, centered(area, area.width, height));
+        // Sin carátula (cargando o nada sonando): el logo de Spotify, si
+        // cabe entero (recortado no se reconoce).
+        if fits(&LOGO_SMALL, area.width, area.height) {
+            let logo = Paragraph::new(logo_lines(&LOGO_SMALL)).alignment(Alignment::Center);
+            f.render_widget(logo, centered(area, area.width, to_u16(LOGO_SMALL.len())));
+        }
         return;
     }
     // `Scale` amplía también las imágenes pequeñas para ocupar todo el hueco.
@@ -493,9 +622,10 @@ const FOOTER_KEYS: [(&str, &str); 11] = [
     ("d", "dispositivos"),
 ];
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    // Prioridad: aviso reciente → problema de sesión (persistente) → atajos.
-    let line = if let Some(status) = app.visible_status() {
+/// Contenido del pie. Prioridad: aviso reciente → problema de sesión
+/// (persistente) → atajos.
+fn footer_line(app: &App) -> Line<'static> {
+    if let Some(status) = app.visible_status() {
         let style = if status.error {
             theme::error()
         } else {
@@ -506,8 +636,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Line::styled(format!(" {problem}"), theme::error())
     } else {
         Line::from_iter(FOOTER_KEYS.iter().flat_map(|(k, v)| theme::key_hint(k, v)))
-    };
-    f.render_widget(Paragraph::new(line), area);
+    }
+}
+
+/// Si el pie muestra un aviso (que hay que leer entero) y no los atajos.
+fn is_notice(app: &App) -> bool {
+    app.visible_status().is_some() || app.session_problem().is_some()
 }
 
 fn draw_search(f: &mut Frame, app: &App, main: Rect) {
@@ -714,6 +848,7 @@ pub fn draw_fallback(f: &mut Frame, reason: &str) {
          Prueba a cambiar el tamaño de la ventana, o pulsa q para salir."
     );
     draw_logo_message(f, area, &message);
+    theme::finish_frame(f.buffer_mut());
 }
 
 #[cfg(test)]
@@ -742,6 +877,128 @@ mod tests {
         out
     }
 
+    /// A 80 columnas (y menos) el estado del reproductor se acorta para que
+    /// el volumen se siga viendo; con sitio se explica entero.
+    #[tokio::test]
+    async fn player_status_keeps_the_volume_visible() {
+        let (mut app, _rx) = demo_app();
+        for w in [60, 80] {
+            let text = screen(&mut app, w, 24);
+            assert!(text.contains("Vol 65%"), "a {w} columnas:\n{text}");
+        }
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("⇄ Aleatorio: sí   ↻ Repetir: lista   Vol 65%"));
+    }
+
+    /// El logo del reproductor (sin carátula) sale entero o no sale: nunca
+    /// recortado, en ningún tamaño.
+    #[tokio::test]
+    async fn player_logo_is_never_cut() {
+        let (mut app, _rx) = demo_app();
+        for (w, h) in [(30, 12), (40, 16), (45, 19), (60, 20), (80, 24)] {
+            let text = screen(&mut app, w, h);
+            let whole = LOGO_SMALL.iter().all(|row| text.contains(row.trim()));
+            let any = LOGO_SMALL.iter().any(|row| text.contains(row.trim()));
+            assert_eq!(whole, any, "logo recortado a {w}x{h}:\n{text}");
+        }
+        assert!(screen(&mut app, 80, 24).contains(LOGO_SMALL[0].trim()));
+    }
+
+    /// Un aviso largo usa dos filas del pie si hay sitio, para que la
+    /// instrucción final (cómo recuperar la sesión) se lea entera.
+    #[tokio::test]
+    async fn long_notice_wraps_into_two_footer_rows() {
+        let (mut app, _rx) = demo_app();
+        app.show_error(
+            "sesión caducada o inválida (ejecuta `spotify_cmd --logout` y vuelve a entrar)".into(),
+        );
+        let text = screen(&mut app, 60, 24);
+        assert!(
+            text.contains("--logout") && text.contains("vuelve a entrar"),
+            "{text}"
+        );
+        // Sin aviso, el pie (los atajos) ocupa una sola fila.
+        let (mut quiet, _rx) = demo_app();
+        let text = screen(&mut quiet, 60, 24);
+        let footer_rows = text
+            .lines()
+            .rev()
+            .take_while(|l| !l.starts_with('╰'))
+            .count();
+        assert_eq!(footer_rows, 1, "{text}");
+    }
+
+    /// La ventana de filas visibles contiene siempre la seleccionada y solo
+    /// se mueve lo justo (como el desplazamiento de ratatui).
+    #[test]
+    fn visible_window_follows_the_selection() {
+        assert_eq!(visible_window(2000, 20, 0, Some(0)), (0, 20));
+        assert_eq!(visible_window(2000, 20, 0, Some(25)), (6, 26));
+        assert_eq!(
+            visible_window(2000, 20, 6, Some(10)),
+            (6, 26),
+            "no se mueve"
+        );
+        assert_eq!(visible_window(2000, 20, 6, Some(3)), (3, 23));
+        assert_eq!(visible_window(5, 20, 0, Some(4)), (0, 5));
+        assert_eq!(visible_window(0, 20, 7, None), (0, 0));
+        // Un desplazamiento viejo (la lista se acortó) no deja la ventana vacía.
+        assert_eq!(visible_window(10, 20, 500, None), (9, 10));
+        for (len, visible, offset, sel) in [(2000, 1, 0, 1999), (3, 1, 2, 0), (100, 7, 50, 99)] {
+            let (start, end) = visible_window(len, visible, offset, Some(sel));
+            assert!(start <= sel && sel < end && end - start <= visible);
+        }
+    }
+
+    /// Si solo se cargó una parte de la lista, el título lo dice; si está
+    /// entera, solo da el número.
+    #[tokio::test]
+    async fn partial_list_title_says_so() {
+        let (mut app, _rx) = demo_app();
+        assert!(screen(&mut app, 100, 30).contains(" Tus me gusta · 2 "));
+        if let MainContent::Tracks { total, .. } = &mut app.main {
+            *total = 5000;
+        }
+        assert!(screen(&mut app, 100, 30).contains(" Tus me gusta · 2 de 5000 "));
+    }
+
+    /// Con una lista larga se ve la fila seleccionada con su número real.
+    #[tokio::test]
+    async fn long_list_shows_the_selected_row() {
+        let (mut app, _rx) = demo_app();
+        let MainContent::Tracks { tracks, .. } = &mut app.main else {
+            unreachable!()
+        };
+        let one = tracks[1].clone();
+        *tracks = vec![one; 2000];
+        app.main_state.select(Some(1499));
+        let text = screen(&mut app, 100, 30);
+        assert!(text.contains("▌1500 "), "{text}");
+        assert!(
+            !text.contains("│ 1    Billie"),
+            "las primeras filas no se ven"
+        );
+    }
+
+    /// Mide el dibujado con una lista grande (cargo test --release bench_big_list -- --ignored --nocapture).
+    #[tokio::test]
+    #[ignore]
+    async fn bench_big_list() {
+        let (mut app, _rx) = demo_app();
+        let MainContent::Tracks { tracks, .. } = &mut app.main else {
+            unreachable!()
+        };
+        let one = tracks[0].clone();
+        *tracks = vec![one; std::env::var("ROWS").map_or(2000, |v| v.parse().unwrap())];
+        app.main_state.select(Some(tracks.len() / 2));
+        let mut terminal = Terminal::new(TestBackend::new(200, 60)).unwrap();
+        let start = Instant::now();
+        for _ in 0..200 {
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        println!("por fotograma: {:?}", start.elapsed() / 200);
+    }
+
     fn demo_app() -> (
         App,
         tokio::sync::mpsc::UnboundedReceiver<ratatui_image::thread::ResizeRequest>,
@@ -764,6 +1021,7 @@ mod tests {
         app.main = MainContent::Tracks {
             title: "Tus me gusta".into(),
             source: TrackSource::Uris,
+            total: 2,
             tracks: vec![
                 track(
                     "Bohemian Rhapsody",
@@ -1153,6 +1411,7 @@ mod robustness {
                 title: name.into(),
                 source: TrackSource::Uris,
                 tracks: WEIRD.iter().map(|n| track(n)).collect(),
+                total: step,
             },
             _ => MainContent::Contexts {
                 title: name.into(),

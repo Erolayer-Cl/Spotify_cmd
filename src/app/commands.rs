@@ -151,6 +151,7 @@ mod tests {
             title: "Lista".into(),
             source: TrackSource::Uris,
             tracks: vec![track("A", ID_A, None), track("B", ID_B, None)],
+            total: 2,
         };
         app.main_state.select(Some(0));
         app.focus = Focus::Main;

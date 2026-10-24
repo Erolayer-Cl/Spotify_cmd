@@ -12,7 +12,7 @@ use ratatui_image::{errors::Errors, thread::ResizeResponse};
 
 use super::{App, MainContent, Popup};
 use crate::spotify::{
-    Action, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackEntry,
+    Action, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackList,
 };
 
 /// Mensajes que llegan al bucle principal desde las tareas en segundo plano.
@@ -25,7 +25,7 @@ pub enum Msg {
     Playlists(Result<Vec<PlaylistEntry>>),
     Tracks {
         request: u64,
-        result: Result<Vec<TrackEntry>>,
+        result: Result<TrackList>,
     },
     Search {
         request: u64,
@@ -230,14 +230,14 @@ mod tests {
         assert!(matches!(app.main, MainContent::Message(_)));
         app.on_msg(Msg::Tracks {
             request,
-            result: Ok(vec![song("Bohemian Rhapsody")]),
+            result: Ok(vec![song("Bohemian Rhapsody")].into()),
         });
         assert!(matches!(app.main, MainContent::Message(_)));
         // Volver a abrirla funciona con normalidad.
         app.open_library(LibraryItem::Playlist(0));
         app.on_msg(Msg::Tracks {
             request: app.request_id,
-            result: Ok(vec![song("Bohemian Rhapsody")]),
+            result: Ok(vec![song("Bohemian Rhapsody")].into()),
         });
         assert!(matches!(
             &app.main,

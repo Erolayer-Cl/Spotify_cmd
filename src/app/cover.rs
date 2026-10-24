@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use image::DynamicImage;
-use ratatui_image::{errors::Errors, thread::ResizeResponse};
+use ratatui_image::{errors::Errors, picker::ProtocolType, thread::ResizeResponse};
 
-use super::{App, CrashOrigin, Msg, spawn_guarded};
+use super::{App, CrashOrigin, Msg, Popup, spawn_guarded};
 use crate::spotify;
 
 /// Tras fallar la descarga de una carátula, espera antes de reintentarla.
@@ -126,12 +126,28 @@ impl App {
                 if self.cover.update_resized_protocol(resp) {
                     self.cover_rebuilds = 0;
                 }
+                // Se enviará en el próximo dibujado, bajo la ventana abierta.
+                if self.picker.protocol_type() == ProtocolType::Kitty
+                    && !matches!(self.popup, Popup::None)
+                {
+                    self.cover_sent_under_popup = true;
+                }
             }
             Err(e) => {
                 if !self.rebuild_cover() {
                     self.set_status(format!("Error al dibujar la carátula: {e}"), true);
                 }
             }
+        }
+    }
+
+    /// Vuelve a enviar la carátula si se envió con una ventana encima (ver
+    /// `cover_sent_under_popup`). Se llama al cerrar una ventana.
+    pub(super) fn resend_cover_if_hidden(&mut self) {
+        if std::mem::take(&mut self.cover_sent_under_popup)
+            && let Some(img) = self.cover_image.clone()
+        {
+            self.prepare_cover(img);
         }
     }
 
@@ -158,7 +174,9 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     use super::*;
-    use crate::app::tests::{crash, now_playing, resize_error, status, test_app};
+    use crossterm::event::KeyCode;
+
+    use crate::app::tests::{crash, key, now_playing, resize_error, status, test_app};
     use crate::spotify::Playback;
 
     fn tiny_image() -> DynamicImage {
@@ -243,6 +261,45 @@ mod tests {
         let origin = CrashOrigin::Resize(app.cover_generation());
         app.on_msg(crash(origin, "panic al codificar"));
         assert!(app.cover.protocol_type().is_some());
+    }
+
+    /// Con Kitty, una carátula enviada bajo una ventana se vuelve a enviar al
+    /// cerrarla (la ventana pudo tapar la celda que la lleva). Sin ventana,
+    /// o con otros protocolos, no se reenvía.
+    #[tokio::test]
+    async fn kitty_cover_sent_under_a_popup_is_sent_again() {
+        let (mut app, mut rx) = test_app();
+        app.picker.set_protocol_type(ProtocolType::Kitty);
+        app.set_cover_image(tiny_image());
+        app.on_event(key(KeyCode::Char('?')));
+        let request = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(finish_resize(request, app.cover_generation()));
+        assert!(app.cover.protocol_type().is_some(), "lista para enviarse");
+        let generation = app.cover_generation();
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(
+            app.cover_generation(),
+            generation + 1,
+            "se prepara otra vez"
+        );
+        assert!(app.cover.protocol_type().is_some());
+
+        // Ya enviada sin ventana encima: cerrar otra ventana no la reenvía.
+        let request = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(finish_resize(request, app.cover_generation()));
+        app.on_event(key(KeyCode::Char('?')));
+        let generation = app.cover_generation();
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(app.cover_generation(), generation);
+
+        // Con Sixel (que se repinta entero al cerrar) tampoco.
+        app.picker.set_protocol_type(ProtocolType::Sixel);
+        app.on_event(key(KeyCode::Char('?')));
+        let request = start_cover_resize(&mut app, &mut rx);
+        app.on_msg(finish_resize(request, app.cover_generation()));
+        let generation = app.cover_generation();
+        app.on_event(key(KeyCode::Esc));
+        assert_eq!(app.cover_generation(), generation);
     }
 
     /// El error tardío del redimensionado de la carátula anterior no toca la

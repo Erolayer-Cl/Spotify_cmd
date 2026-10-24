@@ -9,7 +9,7 @@ use rspotify::model::PlaylistId;
 
 use super::lists::{LoadMode, TrackSource};
 use super::{App, Msg, SETTLE};
-use crate::spotify::{self, PlaylistEntry};
+use crate::spotify::{self, PlaylistEntry, TrackList};
 
 /// Entradas fijas de la barra lateral, seguidas de las playlists del usuario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,16 +148,11 @@ impl App {
                 spotify::saved_tracks(&sp).await
             }),
             LibraryItem::Recent => self.load_tracks(title, loose, mode, |sp| async move {
-                spotify::recently_played(&sp).await
+                spotify::recently_played(&sp).await.map(TrackList::from)
             }),
-            LibraryItem::Queue => {
-                self.load_tracks(
-                    title,
-                    loose,
-                    mode,
-                    |sp| async move { spotify::queue(&sp).await },
-                )
-            }
+            LibraryItem::Queue => self.load_tracks(title, loose, mode, |sp| async move {
+                spotify::queue(&sp).await.map(TrackList::from)
+            }),
             LibraryItem::Playlist(i) => {
                 if let Some(id) = self.playlists.get(i).map(|p| p.id.clone()) {
                     self.load_playlist(title, id, mode);

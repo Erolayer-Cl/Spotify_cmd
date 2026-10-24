@@ -27,6 +27,7 @@ impl App {
         if matches!(closed, Popup::Devices { .. }) {
             self.pending_play = None;
         }
+        self.resend_cover_if_hidden();
     }
 
     /// `true` (una sola vez) si hay que repintar la pantalla entera antes del

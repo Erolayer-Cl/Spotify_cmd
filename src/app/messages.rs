@@ -11,7 +11,9 @@ use image::DynamicImage;
 use ratatui_image::{errors::Errors, thread::ResizeResponse};
 
 use super::{App, MainContent, Popup};
-use crate::spotify::{DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackEntry};
+use crate::spotify::{
+    Action, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackEntry,
+};
 
 /// Mensajes que llegan al bucle principal desde las tareas en segundo plano.
 pub enum Msg {
@@ -39,6 +41,9 @@ pub enum Msg {
     ActionDone {
         done: Option<&'static str>,
         refresh_queue: bool,
+        /// La reproducción enviada, para repetirla en otro dispositivo si no
+        /// había ninguno activo; `None` en las demás acciones.
+        replay: Option<Box<Action>>,
         result: Result<()>,
     },
     Cover {
@@ -92,8 +97,9 @@ impl App {
             Msg::ActionDone {
                 done,
                 refresh_queue,
+                replay,
                 result,
-            } => self.on_action_done(done, refresh_queue, result),
+            } => self.on_action_done(done, refresh_queue, replay, result),
             Msg::Cover { url, result } => self.on_cover(url, result),
             Msg::Resized { generation, result } => self.on_resized(generation, result),
             Msg::Crashed { origin, reason } => self.recover_from_crash(origin, &reason),

@@ -17,6 +17,7 @@ impl App {
             let action = Action::PlayContext {
                 context: context.clone(),
                 start: None,
+                device_id: None,
             };
             self.set_status(format!("Reproduciendo «{title}»"), false);
             self.do_action(action);
@@ -35,16 +36,18 @@ impl App {
                         context_start(tracks, i).map(|start| Action::PlayContext {
                             context: ctx.clone(),
                             start: Some(start),
+                            device_id: None,
                         })
                     }
                     TrackSource::Uris => {
                         // Solo las entradas con ID son reproducibles (no archivos locales).
                         let start = tracks[..i].iter().filter(|t| t.id.is_some()).count();
                         let ids: Vec<_> = tracks.iter().filter_map(|t| t.id.clone()).collect();
-                        track
-                            .id
-                            .as_ref()
-                            .map(|_| Action::PlayTracks { tracks: ids, start })
+                        track.id.as_ref().map(|_| Action::PlayTracks {
+                            tracks: ids,
+                            start,
+                            device_id: None,
+                        })
                     }
                 };
                 (action, track.name.clone())
@@ -54,6 +57,7 @@ impl App {
                 let action = Action::PlayContext {
                     context: entry.id.clone(),
                     start: None,
+                    device_id: None,
                 };
                 (Some(action), entry.name.clone())
             }

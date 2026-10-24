@@ -128,10 +128,15 @@ key("\t", 0.2); key("k", 0.1); key("\r", 1.5)
 check("la cola se puede abrir", any(r.startswith("GET /v1/me/player/queue") for r in requests()))
 
 print("== Salida")
-key("q", 1.0)
+key("\x1b", 0.3)
+v0 = count("PUT /v1/me/player/volume")
+t0 = time.time()
+key("-", 0.0); key("q", 0.0)   # volumen y salida sin esperar al agrupado
 _, st = os.waitpid(pid, 0)
 code = os.waitstatus_to_exitcode(st)
 check("q sale con código 0", code == 0)
+check("el volumen pulsado justo antes de salir llega a Spotify", count("PUT /v1/me/player/volume") == v0 + 1)
+check("y la salida sigue siendo rápida (< 2 s)", time.time() - t0 < 2)
 mock.terminate()
 
 failed = [n for n, ok in results if not ok]

@@ -8,6 +8,9 @@ CHAOS = len(sys.argv) > 3 and sys.argv[3] == "chaos"
 BIG = len(sys.argv) > 3 and sys.argv[3] == "big"
 SAVED_TOTAL = 5000 if BIG else 120
 REFRESH_FAILS = len(sys.argv) > 3 and sys.argv[3] == "refresh_fails"
+# Sin dispositivo activo (Spotify cerrado en todas partes) hasta que la app
+# reproduce en uno concreto (`?device_id=`).
+NO_DEVICE = len(sys.argv) > 3 and sys.argv[3] == "no_device"
 SCOPES = ("user-read-playback-state user-modify-playback-state user-read-currently-playing "
           "playlist-read-private playlist-read-collaborative user-library-read user-read-recently-played")
 import random; rng = random.Random(7)
@@ -51,15 +54,18 @@ def playlist(n, name, total):
             "public": True, "snapshot_id": "s", "items": {"href": "x", "total": total}, "type": "playlist", "uri": f"spotify:playlist:{i}"}
 
 PLAYLISTS = [playlist(1, "Rock en español", 3), playlist(2, "Para estudiar", 2)]
-state = {"playing": True, "track": 1, "shuffle": True, "repeat": "off", "volume": 65, "progress": 83000}
+state = {"playing": True, "track": 1, "shuffle": True, "repeat": "off", "volume": 65, "progress": 83000,
+         "device": None if NO_DEVICE else "dev1"}
 
 def device(n, name, active):
+    if NO_DEVICE: active = state["device"] == f"dev{n}"
     return {"id": f"dev{n}", "is_active": active, "is_private_session": False, "is_restricted": False,
             "name": name, "type": "Computer" if n == 1 else "Smartphone", "volume_percent": state["volume"]}
 
 def playback():
     t = track(state["track"], "Bohemian Rhapsody" if state["track"] == 1 else None)
-    return {"device": device(1, "Mi portátil", True), "repeat_state": state["repeat"], "shuffle_state": state["shuffle"],
+    active = device(2, "Mi móvil", True) if state["device"] == "dev2" else device(1, "Mi portátil", True)
+    return {"device": active, "repeat_state": state["repeat"], "shuffle_state": state["shuffle"],
             "context": None, "timestamp": int(time.time() * 1000), "progress_ms": state["progress"],
             "is_playing": state["playing"], "item": t, "currently_playing_type": "track", "actions": {"disallows": {}}}
 
@@ -132,7 +138,9 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/img/"):
             self.send_response(200); self.send_header("content-type", "image/png")
             self.send_header("content-length", str(len(COVER))); self.end_headers(); self.wfile.write(COVER)
-        elif p == "/v1/me/player": self.send_json(playback())
+        elif p == "/v1/me/player":
+            if state["device"] is None: return self.no_content()  # nada sonando en ningún sitio
+            self.send_json(playback())
         elif p == "/v1/me/playlists": self.send_json(page(PLAYLISTS[off:off + lim], len(PLAYLISTS), off, lim))
         elif p == "/v1/me/tracks":
             if BIG: time.sleep(0.08)  # latencia de red simulada
@@ -165,6 +173,13 @@ class H(BaseHTTPRequestHandler):
                 return self.send_json({"error": "invalid_grant", "error_description": "Refresh token revoked"}, 400)
             return self.send_json({"access_token": "renovado", "token_type": "Bearer", "expires_in": 3600,
                                    "refresh_token": "r2", "scope": SCOPES})
+        if p.startswith("/v1/me/player") and state["device"] is None:
+            device_id = parse_qs(urlparse(self.path).query).get("device_id", [None])[0]
+            if p == "/v1/me/player/play" and device_id:
+                state["device"] = device_id
+            else:
+                return self.send_json({"error": {"status": 404, "message": "Player command failed: No active device found",
+                                                 "reason": "NO_ACTIVE_DEVICE"}}, 404)
         if p == "/v1/me/player/pause": state["playing"] = False
         elif p == "/v1/me/player/play": state["playing"] = True
         elif p == "/v1/me/player/next": state["track"] += 1

@@ -27,15 +27,19 @@ pub enum Action {
     Volume(u8),
     Shuffle(bool),
     Repeat(RepeatState),
-    /// Reproduce una playlist/álbum/artista, opcionalmente desde una canción.
+    /// Reproduce una playlist/álbum/artista, opcionalmente desde una canción,
+    /// en el dispositivo activo o en `device_id`.
     PlayContext {
         context: PlayContextId<'static>,
         start: Option<ContextStart>,
+        device_id: Option<String>,
     },
-    /// Reproduce una lista de canciones sin contexto (me gusta, recientes, búsqueda).
+    /// Reproduce una lista de canciones sin contexto (me gusta, recientes,
+    /// búsqueda), en el dispositivo activo o en `device_id`.
     PlayTracks {
         tracks: Vec<PlayableId<'static>>,
         start: usize,
+        device_id: Option<String>,
     },
     Queue(PlayableId<'static>),
     Transfer {
@@ -92,6 +96,29 @@ impl Action {
         )
     }
 
+    /// La misma reproducción en el dispositivo `id`; `None` si la acción no
+    /// es una reproducción (para repetirla tras elegir dispositivo).
+    pub fn on_device(self, id: String) -> Option<Action> {
+        match self {
+            Action::PlayContext { context, start, .. } => Some(Action::PlayContext {
+                context,
+                start,
+                device_id: Some(id),
+            }),
+            Action::PlayTracks { tracks, start, .. } => Some(Action::PlayTracks {
+                tracks,
+                start,
+                device_id: Some(id),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Si la acción empieza a reproducir algo nuevo.
+    pub fn starts_playback(&self) -> bool {
+        matches!(self, Action::PlayContext { .. } | Action::PlayTracks { .. })
+    }
+
     /// Mensaje que se muestra cuando la acción termina bien.
     pub fn done_message(&self) -> Option<&'static str> {
         match self {
@@ -120,17 +147,30 @@ pub async fn perform(sp: &Client, action: Action) -> Result<()> {
         Action::Volume(v) => sp.volume(v, None).await,
         Action::Shuffle(state) => sp.shuffle(state, None).await,
         Action::Repeat(state) => sp.repeat(state, None).await,
-        Action::PlayContext { context, start } => {
-            sp.start_context_playback(context, None, start.map(ContextStart::offset), None)
-                .await
+        Action::PlayContext {
+            context,
+            start,
+            device_id,
+        } => {
+            sp.start_context_playback(
+                context,
+                device_id.as_deref(),
+                start.map(ContextStart::offset),
+                None,
+            )
+            .await
         }
-        Action::PlayTracks { tracks, start } => {
+        Action::PlayTracks {
+            tracks,
+            start,
+            device_id,
+        } => {
             // La API limita el tamaño del cuerpo: se envía una ventana alrededor
             // de la canción elegida para que "siguiente/anterior" funcionen.
             let (from, to) = uri_window(tracks.len(), start, MAX_URIS);
             let window = tracks[from..to].to_vec();
             let offset = Offset::Position(chrono::Duration::milliseconds((start - from) as i64));
-            sp.start_uris_playback(window, None, Some(offset), None)
+            sp.start_uris_playback(window, device_id.as_deref(), Some(offset), None)
                 .await
         }
         Action::Queue(id) => sp.add_item_to_queue(id, None).await,
@@ -168,10 +208,12 @@ mod tests {
         let play_context = Action::PlayContext {
             context: PlayContextId::Album(album),
             start: None,
+            device_id: None,
         };
         let play_tracks = Action::PlayTracks {
             tracks: Vec::new(),
             start: 0,
+            device_id: None,
         };
         for action in [Action::Next, Action::Previous, play_context, play_tracks] {
             assert!(action.changes_track(), "{action:?}");
@@ -198,6 +240,24 @@ mod tests {
             assert!(action.changes_queue(), "{action:?}");
             assert!(!action.changes_track(), "{action:?}");
         }
+    }
+
+    /// Solo las reproducciones se pueden repetir en otro dispositivo, y
+    /// conservan por dónde empezar.
+    #[test]
+    fn only_playback_moves_to_a_device() {
+        let play = Action::PlayTracks {
+            tracks: Vec::new(),
+            start: 3,
+            device_id: None,
+        };
+        assert!(play.starts_playback());
+        assert!(matches!(
+            play.on_device("altavoz".into()),
+            Some(Action::PlayTracks { start: 3, device_id: Some(id), .. }) if id == "altavoz"
+        ));
+        assert!(!Action::Next.starts_playback());
+        assert!(Action::Next.on_device("altavoz".into()).is_none());
     }
 
     #[test]

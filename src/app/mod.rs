@@ -39,7 +39,7 @@ use ratatui_image::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
-use crate::spotify::{Client, DeviceEntry, Playback, PlaylistEntry, SearchKind};
+use crate::spotify::{Action, Client, DeviceEntry, Playback, PlaylistEntry, SearchKind};
 
 pub use library::{FIXED_LIBRARY, LibraryItem};
 pub use lists::{MainContent, TrackSource};
@@ -112,6 +112,11 @@ pub struct App {
     /// alguna no se consulta el estado: la respuesta aún no las reflejaría y
     /// desharía el cambio optimista.
     actions_inflight: u32,
+    /// Fila de acciones (ver `tasks::spawn_in_order`); se crea al primer uso.
+    actions: Option<UnboundedSender<tasks::ActionJob>>,
+    /// Reproducción que falló por no haber dispositivo activo: se repite en
+    /// el que se elija en la ventana de dispositivos (abierta para eso).
+    pending_play: Option<Action>,
 
     pub playlists: Vec<PlaylistEntry>,
     /// Hay una carga de las playlists en curso.
@@ -195,6 +200,8 @@ impl App {
             last_poll: None,
             refresh_at: None,
             actions_inflight: 0,
+            actions: None,
+            pending_play: None,
             playlists: Vec::new(),
             playlists_inflight: false,
             library_state,

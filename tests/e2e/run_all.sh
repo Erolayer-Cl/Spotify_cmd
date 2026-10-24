@@ -7,6 +7,8 @@ cargo build --release
 BIN=./target/release/spotify_cmd
 echo "== Funcional (lo que se ve y lo que se envía a la API)"
 python3 tests/e2e/functional_test.py "$BIN"
+echo "== Sin dispositivo activo (Enter pide elegir uno y suena en él)"
+python3 tests/e2e/no_device_test.py "$BIN"
 echo "== Pérdida de red y recuperación"
 python3 tests/e2e/network_loss_test.py "$BIN"
 echo "== Renovación del token con la app abierta"

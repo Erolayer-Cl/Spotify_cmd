@@ -48,6 +48,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::app::{App, CrashOrigin, Msg};
 
+/// Texto de `--help`, con la ruta real de la configuración en este sistema.
+fn help() -> String {
+    HELP.replace("{config}", &config::config_path_hint())
+}
+
 const HELP: &str = "\
 spotify_cmd — cliente de Spotify para la terminal
 
@@ -62,7 +67,8 @@ OPCIONES:
     -V, --version   Muestra la versión
 
 CONFIGURACIÓN:
-    ~/.config/spotify_cmd/config.toml  (client_id, redirect_uri, poll_secs)
+    {config}
+    (client_id, redirect_uri, poll_secs)
     Variables: SPOTIFY_CLIENT_ID, SPOTIFY_REDIRECT_URI
 
 Dentro de la aplicación pulsa '?' para ver los atajos de teclado.";
@@ -87,14 +93,14 @@ fn parse_args() -> Result<Option<Args>> {
             }
             "-h" | "--help" => {
                 say_inline!("{}", logo::banner());
-                say!("\n{HELP}");
+                say!("\n{}", help());
                 return Ok(None);
             }
             "-V" | "--version" => {
                 say!("spotify_cmd {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
-            other => anyhow::bail!("opción desconocida: {other}\n\n{HELP}"),
+            other => anyhow::bail!("opción desconocida: {other}\n\n{}", help()),
         }
     }
     Ok(Some(args))
@@ -317,7 +323,31 @@ async fn run(
             () = &mut shutdown => break,
         }
     }
+
+    // 3. Antes de salir, Spotify recibe lo pendiente (la última pausa, el
+    // último cambio de volumen), con un tope de espera.
+    let mut waiting = false;
+    protected(&mut app, |a| waiting = a.prepare_exit());
+    if waiting {
+        let _ = terminal::guard(|| tui.draw(|f| ui::draw(f, &mut app)).map(drop));
+        finish_actions(&mut app, ACTIONS_GRACE).await;
+    }
     Ok(())
+}
+
+/// Tiempo máximo que se espera, al salir, a las acciones en vuelo.
+const ACTIONS_GRACE: Duration = Duration::from_secs(2);
+
+/// Procesa las respuestas de la app hasta que no quede ninguna acción en
+/// vuelo o pasen `max`.
+async fn finish_actions(app: &mut App, max: Duration) {
+    let deadline = tokio::time::Instant::now() + max;
+    while app.has_actions_inflight() {
+        match tokio::time::timeout_at(deadline, app.rx.recv()).await {
+            Ok(Some(msg)) => protected(app, |a| a.on_msg(msg)),
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 /// Borra la pantalla y la vuelve a dibujar entera en el siguiente frame si la
@@ -382,6 +412,14 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    /// La ayuda muestra la ruta real de la configuración en este sistema.
+    #[test]
+    fn help_shows_the_real_config_path() {
+        let text = help();
+        assert!(text.contains(&config::config_path_hint()));
+        assert!(!text.contains("{config}"));
+    }
+
     #[test]
     fn protected_shows_panics_instead_of_closing() {
         let (mut app, _rx) = app::tests::test_app();
@@ -395,6 +433,20 @@ mod tests {
         protected(&mut app, |a| a.should_quit = true);
         assert!(app.should_quit);
         assert!(app.status.is_none());
+    }
+
+    /// Al salir se procesan las respuestas de las acciones en vuelo hasta
+    /// que no queda ninguna.
+    #[tokio::test]
+    async fn exit_waits_for_the_actions_in_flight() {
+        let (mut app, _rx) = app::tests::test_app();
+        app.playback = Some(app::tests::now_playing("A", true));
+        protected(&mut app, |a| {
+            a.on_event(press(crossterm::event::KeyCode::Char('+')))
+        });
+        assert!(app.prepare_exit());
+        finish_actions(&mut app, Duration::from_secs(5)).await;
+        assert!(!app.has_actions_inflight());
     }
 
     /// Dibuja la carátula grande y lanza los redimensionados que pida.

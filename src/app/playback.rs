@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use rspotify::model::RepeatState;
 
-use super::{App, LibraryItem, Msg, SETTLE};
+use super::{App, LibraryItem, Msg, Popup, SETTLE};
 use crate::spotify::{self, Action, ApiError, Playback};
 
 /// Salto de cada avance o retroceso.
@@ -40,10 +40,21 @@ impl<T> Debounced<T> {
 
     fn take_ready(&mut self) -> Option<T> {
         match &self.pending {
-            Some((_, at)) if at.elapsed() >= DEBOUNCE => self.pending.take().map(|(v, _)| v),
+            Some((_, at)) if at.elapsed() >= DEBOUNCE => self.take(),
             _ => None,
         }
     }
+
+    /// Entrega el valor pendiente ya, sin esperar a [`DEBOUNCE`].
+    fn take(&mut self) -> Option<T> {
+        self.pending.take().map(|(v, _)| v)
+    }
+}
+
+/// Si el error de una acción es que no hay ningún dispositivo activo.
+fn no_active_device(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiError>()
+        .is_some_and(|api| api.status == Some(404))
 }
 
 /// Aviso cuando se pulsa un control sin nada sonando.
@@ -220,11 +231,18 @@ impl App {
         }
         let done = action.done_message();
         let refresh_queue = action.changes_queue();
-        self.spawn(
+        // Una reproducción nueva sustituye a la que esperaba dispositivo.
+        let replay = action.starts_playback().then(|| {
+            self.pending_play = None;
+            Box::new(action.clone())
+        });
+        // En la fila: salen a Spotify de una en una y en el orden de las teclas.
+        self.spawn_in_order(
             |sp| async move { spotify::perform(&sp, action).await },
             move |result| Msg::ActionDone {
                 done,
                 refresh_queue,
+                replay,
                 result,
             },
         );
@@ -236,6 +254,7 @@ impl App {
         &mut self,
         done: Option<&'static str>,
         refresh_queue: bool,
+        replay: Option<Box<Action>>,
         result: Result<()>,
     ) {
         self.actions_inflight = self.actions_inflight.saturating_sub(1);
@@ -248,10 +267,19 @@ impl App {
                 if let Some(text) = done {
                     self.set_status(text, false);
                 }
+                // Ya suena: lo que esperaba dispositivo quedó atrás.
+                if replay.is_some() {
+                    self.pending_play = None;
+                }
             }
             Err(e) => {
                 self.note_rate_limit(&e);
-                self.set_status(e.to_string(), true);
+                match replay {
+                    Some(play) if no_active_device(&e) && matches!(self.popup, Popup::None) => {
+                        self.ask_device_for(*play);
+                    }
+                    _ => self.set_status(e.to_string(), true),
+                }
             }
         }
         self.schedule_refresh(SETTLE);
@@ -259,6 +287,17 @@ impl App {
         if succeeded && refresh_queue && self.active_library == Some(LibraryItem::Queue) {
             self.schedule_list_reload();
         }
+    }
+
+    /// La reproducción `play` falló por no haber dispositivo activo: se abre
+    /// la ventana de dispositivos y se repetirá en el que se elija.
+    fn ask_device_for(&mut self, play: Action) {
+        self.open_devices();
+        self.pending_play = Some(play);
+        self.set_status(
+            "No hay ningún dispositivo activo: elige dónde reproducir",
+            true,
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -331,6 +370,28 @@ impl App {
         }
     }
 
+    /// Al salir: envía ya el avance y el volumen pendientes (sin esperar a
+    /// [`DEBOUNCE`]; si no, la última tecla se perdería) y devuelve si quedan
+    /// acciones por responder. Si quedan, lo avisa en la barra de estado.
+    pub fn prepare_exit(&mut self) -> bool {
+        if let Some(position_ms) = self.pending_seek.take() {
+            self.do_action(Action::Seek { position_ms });
+        }
+        if let Some(volume) = self.pending_volume.take() {
+            self.do_action(Action::Volume(volume));
+        }
+        let waiting = self.has_actions_inflight();
+        if waiting {
+            self.set_status("Enviando los últimos cambios a Spotify…", false);
+        }
+        waiting
+    }
+
+    /// Si alguna acción enviada aún no ha respondido.
+    pub fn has_actions_inflight(&self) -> bool {
+        self.actions_inflight > 0
+    }
+
     pub(super) fn toggle_shuffle(&mut self) {
         let Some(pb) = self.playback_or_warn() else {
             return;
@@ -376,6 +437,7 @@ mod tests {
         Msg::ActionDone {
             done: None,
             refresh_queue: false,
+            replay: None,
             result: Ok(()),
         }
     }
@@ -438,6 +500,7 @@ mod tests {
         app.on_msg(Msg::ActionDone {
             done: None,
             refresh_queue: true,
+            replay: None,
             result: Ok(()),
         });
         assert!(app.list_reload_at.is_some(), "la cola debe recargarse");
@@ -610,6 +673,25 @@ mod tests {
             result: Ok(Some(now_playing("A", true))),
         });
         assert!(app.playback.is_some() && !is_playing(&app));
+    }
+
+    /// Al salir, el volumen y el avance pendientes se envían ya, sin esperar
+    /// a que pase el agrupado; sin nada pendiente no hay que esperar.
+    #[tokio::test]
+    async fn exit_sends_pending_changes_right_away() {
+        let (mut app, _rx) = test_app();
+        assert!(!app.prepare_exit(), "sin nada pendiente se sale ya");
+        app.playback = Some(now_playing("A", true));
+        app.on_event(key(KeyCode::Char('+')));
+        app.on_event(key(KeyCode::Right));
+        assert!(app.pending_volume.is_pending() && app.pending_seek.is_pending());
+        assert!(app.prepare_exit());
+        assert!(!app.pending_volume.is_pending() && !app.pending_seek.is_pending());
+        assert_eq!(app.actions_inflight, 2);
+        for msg in crate::app::tests::responses(&mut app).await {
+            app.on_msg(msg);
+        }
+        assert!(!app.has_actions_inflight(), "las dos responden");
     }
 
     /// Un salto de posición aún sin enviar no cae en la canción siguiente

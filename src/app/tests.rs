@@ -16,7 +16,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use super::{App, CrashOrigin, Msg};
 use crate::spotify::{
-    Client, ContextEntry, Playback, PlaylistEntry, SearchKind, SearchResults, TrackEntry,
+    Client, ContextEntry, DeviceEntry, Playback, PlaylistEntry, SearchKind, SearchResults,
+    TrackEntry,
 };
 
 /// Id de una canción de prueba.
@@ -110,7 +111,7 @@ pub(super) fn track(name: &str, id: &str, position: Option<u32>) -> TrackEntry {
 }
 
 /// Estado de reproducción con la canción `title`.
-pub(super) fn now_playing(title: &str, is_playing: bool) -> Playback {
+pub fn now_playing(title: &str, is_playing: bool) -> Playback {
     Playback {
         is_playing,
         progress_ms: 1_000,
@@ -199,34 +200,71 @@ fn err<T>() -> Result<T> {
 fn random_msg(rng: &mut Lcg, app: &App) -> Msg {
     let request = app.request_id.wrapping_sub((rng.next() % 2) as u64);
     let seq = app.poll_seq.wrapping_sub((rng.next() % 2) as u64);
-    match rng.next() % 8 {
+    match rng.next() % 12 {
         0 => Msg::Playback {
             seq,
             result: Ok(None),
         },
         1 => Msg::Playback { seq, result: err() },
-        2 => Msg::Tracks {
-            request,
-            result: Ok(Vec::new()),
+        // Con algo sonando, los controles cambian el estado de verdad.
+        2 => Msg::Playback {
+            seq,
+            result: Ok(Some(now_playing("Sonando", rng.next().is_multiple_of(2)))),
         },
         3 => Msg::Tracks {
             request,
+            result: Ok(Vec::new()),
+        },
+        // Filas reales: moverse, reproducir, encolar y seguir la selección.
+        4 => Msg::Tracks {
+            request,
+            result: Ok((0..rng.next() % 40)
+                .map(|i| match i % 3 {
+                    0 => song("Local"),
+                    1 => track("A", ID_A, Some(i as u32)),
+                    _ => track("B", ID_B, None),
+                })
+                .collect()),
+        },
+        5 => Msg::Tracks {
+            request,
             result: err(),
         },
-        4 => Msg::Devices {
+        6 => Msg::Devices {
             request: app.devices_request.wrapping_sub((rng.next() % 2) as u64),
             result: Ok(Vec::new()),
         },
-        5 => Msg::ActionDone {
+        7 => Msg::Devices {
+            request: app.devices_request,
+            result: Ok(vec![DeviceEntry {
+                id: Some("altavoz".into()),
+                name: "Altavoz".into(),
+                kind: "Speaker".into(),
+                active: rng.next().is_multiple_of(2),
+            }]),
+        },
+        8 => Msg::ActionDone {
             done: Some("ok"),
             refresh_queue: true,
+            replay: None,
             result: err(),
         },
-        6 => Msg::Search {
+        // Una reproducción sin dispositivo activo.
+        9 => Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            replay: Some(Box::new(crate::spotify::Action::PlayTracks {
+                tracks: Vec::new(),
+                start: 0,
+                device_id: None,
+            })),
+            result: Err(anyhow::Error::new(crate::spotify::ApiError::player(404))),
+        },
+        10 => Msg::Search {
             request,
             title: "t".into(),
             kind: SearchKind::Albums,
-            result: Ok(SearchResults::Contexts(Vec::new())),
+            result: Ok(SearchResults::Contexts(vec![album("Disco")])),
         },
         _ if rng.next().is_multiple_of(2) => crash(CrashOrigin::List(request), "panic simulado"),
         _ => crash(CrashOrigin::Other, "panic simulado"),
@@ -249,5 +287,31 @@ async fn survives_random_keys_and_messages() {
         app.on_tick();
         // No salir: se reabre si alguna tecla pidió cerrar.
         app.should_quit = false;
+    }
+}
+
+/// Lo mismo, dibujando cada estado en ventanas de tamaños variados (de
+/// diminutas a enormes): el dibujado tampoco debe fallar nunca.
+#[tokio::test]
+async fn survives_random_keys_and_messages_while_drawing() {
+    let (mut app, _rx) = test_app();
+    let mut rng = Lcg(7);
+    let sizes = [(1, 1), (20, 6), (45, 14), (80, 24), (200, 60)];
+    let mut terminals: Vec<_> = sizes
+        .iter()
+        .map(|&(w, h)| ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap())
+        .collect();
+    for i in 0..2_000 {
+        if rng.next().is_multiple_of(3) {
+            let msg = random_msg(&mut rng, &app);
+            app.on_msg(msg);
+        } else {
+            let code = KEYS[rng.next() % KEYS.len()];
+            app.on_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        app.on_tick();
+        app.should_quit = false;
+        let tui = &mut terminals[i % sizes.len()];
+        tui.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
     }
 }

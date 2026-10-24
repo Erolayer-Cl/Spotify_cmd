@@ -622,6 +622,7 @@ mod tests {
         app.on_msg(Msg::ActionDone {
             done: None,
             refresh_queue: true,
+            replay: None,
             result: Err(anyhow::anyhow!("sin dispositivo")),
         });
         assert!(
@@ -631,6 +632,7 @@ mod tests {
         app.on_msg(Msg::ActionDone {
             done: None,
             refresh_queue: true,
+            replay: None,
             result: Ok(()),
         });
         app.on_tick();

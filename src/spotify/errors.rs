@@ -34,6 +34,15 @@ impl ApiError {
         }
     }
 
+    /// Error de una acción del reproductor con el código `status`.
+    pub fn player(status: u16) -> Self {
+        ApiError {
+            status: Some(status),
+            retry_after: None,
+            message: status_message(status, Kind::Player, None),
+        }
+    }
+
     /// Error al pedir las canciones de una playlist: con el código `status`
     /// o, si es `None`, sin red.
     pub fn playlist_items(status: Option<u16>) -> Self {

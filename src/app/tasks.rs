@@ -6,8 +6,8 @@
 use std::{any::Any, future::Future, panic::AssertUnwindSafe};
 
 use anyhow::Result;
-use futures::FutureExt;
-use tokio::sync::mpsc::UnboundedSender;
+use futures::{FutureExt, future::BoxFuture};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
 use super::{App, CrashOrigin, Msg};
@@ -42,6 +42,28 @@ where
             .unwrap_or_else(|payload| crashed(origin, payload));
         let _ = tx.send(msg);
     });
+}
+
+/// Trabajo de la fila de acciones: produce el mensaje de respuesta.
+pub(super) type ActionJob = BoxFuture<'static, Msg>;
+
+/// Fila de acciones: una sola tarea las ejecuta de una en una, en el orden
+/// en que llegan. Con tareas sueltas, dos pulsaciones seguidas (espacio y
+/// espacio, 's' y 's') podían llegar a Spotify al revés y dejar el estado
+/// contrario a la última tecla. Cada trabajo está protegido: un *panic*
+/// responde con [`Msg::Crashed`] y la fila sigue.
+fn spawn_action_runner(tx: UnboundedSender<Msg>) -> UnboundedSender<ActionJob> {
+    let (jobs, mut pending) = unbounded_channel::<ActionJob>();
+    tokio::spawn(async move {
+        while let Some(job) = pending.recv().await {
+            let msg = match AssertUnwindSafe(job).catch_unwind().await {
+                Ok(msg) => msg,
+                Err(payload) => crashed(CrashOrigin::Other, payload),
+            };
+            let _ = tx.send(msg);
+        }
+    });
+    jobs
 }
 
 /// Mensaje de un *panic* en una tarea de origen `origin`.
@@ -109,6 +131,29 @@ async fn renew_session(sp: &Client, tx: &UnboundedSender<Msg>) -> Session {
     }
 }
 
+/// Petición a Spotify: renueva la sesión si hace falta, ejecuta `query` y
+/// responde con `reply` y su resultado. Si la sesión no sirve (ver
+/// [`Session::Unusable`]), `query` no se ejecuta y `reply` recibe el error.
+async fn request<T, Q, Fut, R>(
+    sp: Client,
+    tx: UnboundedSender<Msg>,
+    origin: CrashOrigin,
+    query: Q,
+    reply: R,
+) -> Msg
+where
+    Q: FnOnce(Client) -> Fut,
+    Fut: Future<Output = Result<T>>,
+    R: FnOnce(Result<T>) -> Msg,
+{
+    let result = match renew_session(&sp, &tx).await {
+        Session::Ready => query(sp).await,
+        Session::Unusable(reason) => Err(anyhow::Error::new(SessionUnusable(reason))),
+        Session::Crashed(payload) => return crashed(origin, payload),
+    };
+    reply(result)
+}
+
 impl App {
     /// Lanza en segundo plano la petición `query` a Spotify (renovando antes
     /// la sesión si hace falta) y responde con `reply` y su resultado. Si la
@@ -117,6 +162,7 @@ impl App {
     /// para cancelarla.
     pub(super) fn spawn<T, Q, Fut, R>(&self, query: Q, reply: R) -> AbortHandle
     where
+        T: 'static,
         Q: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
         R: FnOnce(Result<T>) -> Msg + Send + 'static,
@@ -128,20 +174,43 @@ impl App {
     /// sesión) se comunica como de origen `origin`.
     fn spawn_as<T, Q, Fut, R>(&self, origin: CrashOrigin, query: Q, reply: R) -> AbortHandle
     where
+        T: 'static,
         Q: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
         R: FnOnce(Result<T>) -> Msg + Send + 'static,
     {
-        let sp = self.spotify.clone();
+        let request = request(self.spotify.clone(), self.tx.clone(), origin, query, reply);
+        spawn_guarded(self.tx.clone(), origin, request)
+    }
+
+    /// Como [`Self::spawn`], pero en la fila de acciones: las peticiones que
+    /// cambian el estado de Spotify salen de una en una y en orden.
+    pub(super) fn spawn_in_order<T, Q, Fut, R>(&mut self, query: Q, reply: R)
+    where
+        T: 'static,
+        Q: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        R: FnOnce(Result<T>) -> Msg + Send + 'static,
+    {
         let tx = self.tx.clone();
-        spawn_guarded(self.tx.clone(), origin, async move {
-            let result = match renew_session(&sp, &tx).await {
-                Session::Ready => query(sp).await,
-                Session::Unusable(reason) => Err(anyhow::Error::new(SessionUnusable(reason))),
-                Session::Crashed(payload) => return crashed(origin, payload),
-            };
-            reply(result)
-        })
+        let job = request(
+            self.spotify.clone(),
+            tx.clone(),
+            CrashOrigin::Other,
+            query,
+            reply,
+        )
+        .boxed();
+        // La fila se crea al primer uso (necesita el runtime de tokio).
+        let runner = self
+            .actions
+            .get_or_insert_with(|| spawn_action_runner(tx.clone()));
+        // Si la tarea de la fila hubiera terminado, se crea otra y se reenvía.
+        if let Err(lost) = runner.send(job) {
+            let runner = spawn_action_runner(tx);
+            let _ = runner.send(lost.0);
+            self.actions = Some(runner);
+        }
     }
 
     /// Muestra en la barra de estado el error `err` de una petición, tras
@@ -159,6 +228,7 @@ impl App {
     /// se atribuye a esta petición.
     pub(super) fn spawn_list<T, Q, Fut, R>(&mut self, query: Q, reply: R)
     where
+        T: 'static,
         Q: FnOnce(Client) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
         R: FnOnce(Result<T>) -> Msg + Send + 'static,
@@ -227,6 +297,7 @@ mod tests {
             |result| Msg::ActionDone {
                 done: None,
                 refresh_queue: false,
+                replay: None,
                 result,
             },
         );
@@ -243,6 +314,45 @@ mod tests {
             m,
             Msg::ActionDone { result: Err(e), .. } if e.to_string() == problem
         )));
+    }
+
+    /// Las acciones salen de una en una y en orden, aunque la primera tarde
+    /// más; un *panic* en una no detiene las siguientes.
+    #[tokio::test]
+    async fn actions_run_one_at_a_time_in_order() {
+        let (mut app, _rx) = test_app();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let done = |result| Msg::ActionDone {
+            done: None,
+            refresh_queue: false,
+            replay: None,
+            result,
+        };
+        let slow = log.clone();
+        app.spawn_in_order(
+            move |_| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                slow.lock().unwrap().push(1);
+                Ok(())
+            },
+            done,
+        );
+        app.spawn_in_order(|_| async move { panic!("acción rota") }, done);
+        let fast = log.clone();
+        app.spawn_in_order(
+            move |_| async move {
+                fast.lock().unwrap().push(2);
+                Ok(())
+            },
+            done,
+        );
+        let msgs = responses(&mut app).await;
+        assert_eq!(*log.lock().unwrap(), [1, 2]);
+        let answers = msgs
+            .iter()
+            .filter(|m| matches!(m, Msg::ActionDone { .. } | Msg::Crashed { .. }))
+            .count();
+        assert_eq!(answers, 3, "cada acción responde");
     }
 
     /// La consulta periódica que no se envió por la sesión no tapa su aviso

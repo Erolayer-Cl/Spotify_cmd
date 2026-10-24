@@ -101,6 +101,19 @@ fn restrict_to_owner(path: &Path) {
 #[cfg(not(unix))]
 fn restrict_to_owner(_path: &Path) {}
 
+/// Ruta del archivo de configuración, para mostrarla (sin crear nada).
+pub fn config_path_hint() -> String {
+    dirs::config_dir().map_or_else(
+        || "~/.config/spotify_cmd/config.toml".to_string(),
+        |dir| {
+            dir.join("spotify_cmd")
+                .join("config.toml")
+                .display()
+                .to_string()
+        },
+    )
+}
+
 pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }

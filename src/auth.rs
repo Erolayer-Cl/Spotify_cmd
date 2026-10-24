@@ -3,7 +3,11 @@
 //! Solo hace falta el Client ID (no el secreto). El token se guarda en disco y
 //! se renueva automáticamente, así que el navegador solo se abre la primera vez.
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rspotify::{AuthCodePkceSpotify, Credentials, OAuth, prelude::*, scopes};
@@ -18,6 +22,8 @@ use crate::logo;
 use crate::spotify::{self, RefreshFailure};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
+/// Si la redirección no llega en este tiempo, se explica qué suele fallar.
+const HINT_AFTER: Duration = Duration::from_secs(45);
 /// Tiempo máximo para recibir la primera línea de una petición en el servidor
 /// de la redirección. Los navegadores abren conexiones de reserva que no
 /// envían nada; no deben retrasar el login.
@@ -92,7 +98,7 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
     let listener = if manual {
         None
     } else {
-        bind_redirect(spotify.get_socket_address(&spotify.oauth.redirect_uri)).await
+        bind_redirect(redirect_address(&spotify.oauth.redirect_uri)).await
     };
     if !manual {
         let _ = webbrowser::open(&url);
@@ -104,9 +110,11 @@ pub async fn authenticate(cfg: &Config, manual: bool) -> Result<AuthCodePkceSpot
                 .map_or_else(|_| "127.0.0.1".to_string(), |a| a.to_string());
             say!("Esperando la redirección en http://{addr} ... (Ctrl+C para cancelar)");
             let state = spotify.oauth.state.clone();
-            tokio::time::timeout(AUTH_TIMEOUT, wait_for_code(listener, state))
-                .await
-                .map_err(|_| anyhow!("se agotó el tiempo de espera de la autorización"))??
+            let hint = redirect_hint(&spotify.oauth.redirect_uri);
+            wait_with_hint(wait_for_code(listener, state), HINT_AFTER, || {
+                say!("\n{hint}")
+            })
+            .await?
         }
         None => {
             say!("Tras aceptar, el navegador te llevará a una página que puede no cargar.");
@@ -167,6 +175,71 @@ async fn save_session_or_warn(spotify: &AuthCodePkceSpotify) {
             "Aviso: no se pudo guardar la sesión ({e:#}); habrá que volver a entrar la próxima vez."
         );
     }
+}
+
+/// Dirección local donde escuchar la redirección, o `None` (modo manual) si
+/// la Redirect URI no es `http://` en esta máquina. Con `https://` el
+/// navegador hablaría TLS con un servidor que no lo entiende, y con otro host
+/// la redirección no llegaría aquí: el login no terminaría nunca.
+///
+/// No se usa `get_socket_address` de rspotify: con un host que no es una IP
+/// (`localhost`, un dominio) escucha en `0.0.0.0`, abierto a toda la red.
+fn redirect_address(redirect_uri: &str) -> Option<SocketAddr> {
+    let address = local_http_address(redirect_uri);
+    if address.is_none() {
+        say_err!("La Redirect URI ({redirect_uri}) no es http:// local; se pasa al modo manual.\n");
+    }
+    address
+}
+
+/// Dirección de una URI `http://` de esta máquina (IP de *loopback* o
+/// `localhost`, que se escucha solo en 127.0.0.1).
+fn local_http_address(uri: &str) -> Option<SocketAddr> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let ip = match url.host()? {
+        url::Host::Ipv4(ip) => IpAddr::V4(ip),
+        url::Host::Ipv6(ip) => IpAddr::V6(ip),
+        url::Host::Domain(name) if name.eq_ignore_ascii_case("localhost") => {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        }
+        url::Host::Domain(_) => return None,
+    };
+    if !ip.is_loopback() {
+        return None;
+    }
+    Some(SocketAddr::new(ip, url.port_or_known_default()?))
+}
+
+/// Qué revisar si tras aceptar en el navegador no llega la redirección.
+fn redirect_hint(redirect_uri: &str) -> String {
+    format!(
+        "¿Ya aceptaste y no pasa nada? Revisa que en tu app de Spotify \
+         (developer.spotify.com/dashboard → Settings → Redirect URIs) esté \
+         exactamente {redirect_uri}\n\
+         Si no, sal con Ctrl+C y usa `spotify_cmd --manual-auth`."
+    )
+}
+
+/// Espera a `code` como mucho [`AUTH_TIMEOUT`]. Si a los `hint_after` aún
+/// no ha llegado, llama una vez a `hint` y sigue esperando.
+async fn wait_with_hint(
+    code: impl Future<Output = Result<String>>,
+    hint_after: Duration,
+    hint: impl FnOnce(),
+) -> Result<String> {
+    let code = tokio::time::timeout(AUTH_TIMEOUT, code);
+    tokio::pin!(code);
+    let result = tokio::select! {
+        result = &mut code => result,
+        () = tokio::time::sleep(hint_after) => {
+            hint();
+            code.await
+        }
+    };
+    result.map_err(|_| anyhow!("se agotó el tiempo de espera de la autorización"))?
 }
 
 /// Reserva la dirección de la redirección. Devuelve `None` (y se pasa al modo
@@ -412,6 +485,50 @@ mod tests {
         let addr = busy.local_addr().unwrap();
         assert!(bind_redirect(Some(addr)).await.is_none());
         assert!(bind_redirect(None).await.is_none());
+    }
+
+    /// Solo se escucha la redirección si es `http://` en esta máquina: con
+    /// `https://` (o en otra máquina) el login no terminaría nunca.
+    #[test]
+    fn only_local_http_redirects_are_listened_to() {
+        let addr = |s: &str| Some(s.parse::<SocketAddr>().unwrap());
+        for (uri, expected) in [
+            ("http://127.0.0.1:8898/callback", addr("127.0.0.1:8898")),
+            ("HTTP://127.0.0.1:8898/", addr("127.0.0.1:8898")),
+            ("http://[::1]:8898/callback", addr("[::1]:8898")),
+            ("http://127.0.0.1/callback", addr("127.0.0.1:80")),
+            // `localhost` solo en 127.0.0.1, nunca en todas las interfaces.
+            ("http://localhost:8888/callback", addr("127.0.0.1:8888")),
+            ("https://127.0.0.1:8898/callback", None),
+            ("http://example.com/callback", None),
+            ("http://192.168.1.10:8898/callback", None),
+            ("http://0.0.0.0:8898/callback", None),
+            ("miapp://callback", None),
+            ("no es una url", None),
+        ] {
+            assert_eq!(local_http_address(uri), expected, "{uri}");
+        }
+    }
+
+    /// Si la redirección tarda, se explica qué revisar una sola vez y se
+    /// sigue esperando; si llega antes, no se dice nada.
+    #[tokio::test]
+    async fn slow_redirect_gives_a_hint_and_keeps_waiting() {
+        let late = async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok("codigo".to_string())
+        };
+        let mut hints = 0;
+        let code = wait_with_hint(late, Duration::from_millis(30), || hints += 1).await;
+        assert_eq!(code.unwrap(), "codigo");
+        assert_eq!(hints, 1);
+
+        let mut hints = 0;
+        let quick = async { Ok("rapido".to_string()) };
+        let code = wait_with_hint(quick, Duration::from_millis(30), || hints += 1).await;
+        assert_eq!(code.unwrap(), "rapido");
+        assert_eq!(hints, 0);
+        assert!(redirect_hint("http://127.0.0.1:8898/callback").contains("8898/callback"));
     }
 
     /// rspotify no escribe la caché: si lo hiciera, un fallo al guardar

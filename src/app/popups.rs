@@ -23,6 +23,10 @@ impl App {
         if leaves_trace_on_cover(&closed, self.picker.protocol_type()) {
             self.full_redraw = true;
         }
+        // La reproducción pendiente solo vale mientras se elige dispositivo.
+        if matches!(closed, Popup::Devices { .. }) {
+            self.pending_play = None;
+        }
     }
 
     /// `true` (una sola vez) si hay que repintar la pantalla entera antes del
@@ -43,12 +47,14 @@ impl App {
     }
 
     /// Escribe en el buscador: si aún se muestra la búsqueda anterior, la
-    /// sustituye en lugar de añadirse detrás.
+    /// sustituye en lugar de añadirse detrás. Lo que pase de
+    /// [`MAX_SEARCH_CHARS`] se descarta.
     fn type_in_search(&mut self, text: &str) {
         if std::mem::take(&mut self.search_fresh) {
             self.search_input.clear();
         }
-        self.search_input.push_str(text);
+        let room = MAX_SEARCH_CHARS.saturating_sub(self.search_input.chars().count());
+        self.search_input.extend(text.chars().take(room));
     }
 
     /// En el buscador las teclas escriben texto en vez de ejecutar órdenes.
@@ -88,9 +94,14 @@ impl App {
         }
     }
 
-    /// Texto pegado en el buscador.
+    /// Texto pegado en el buscador. De un pegado enorme solo se mira el
+    /// principio: el resto no cabría.
     pub(super) fn on_search_paste(&mut self, text: &str) {
-        self.type_in_search(&pasted_text(text));
+        let start = text
+            .char_indices()
+            .nth(MAX_SEARCH_CHARS * 4)
+            .map_or(text, |(end, _)| &text[..end]);
+        self.type_in_search(&pasted_text(start));
     }
 
     // -----------------------------------------------------------------------
@@ -140,9 +151,10 @@ impl App {
                     .selected()
                     .and_then(|i| list.get(i))
                     .and_then(|d| d.id.clone());
+                let pending = self.pending_play.take();
                 self.close_popup();
                 match device {
-                    Some(device_id) => self.do_action(Action::Transfer { device_id }),
+                    Some(device_id) => self.do_action(device_choice(pending, device_id)),
                     None => self.set_status("Ese dispositivo no se puede controlar", true),
                 }
             }
@@ -187,6 +199,20 @@ fn leaves_trace_on_cover(popup: &Popup, protocol: ProtocolType) -> bool {
         && matches!(protocol, ProtocolType::Sixel | ProtocolType::Iterm2)
 }
 
+/// Acción al elegir el dispositivo `device_id`: si la ventana se abrió para
+/// la reproducción `pending` (que falló sin dispositivo), se repite en el
+/// elegido; si no, se le pasa lo que esté sonando.
+fn device_choice(pending: Option<Action>, device_id: String) -> Action {
+    pending
+        .and_then(|play| play.on_device(device_id.clone()))
+        .unwrap_or(Action::Transfer { device_id })
+}
+
+/// Largo máximo de una búsqueda, en caracteres. Ninguna búsqueda real se
+/// acerca; un pegado enorme (un archivo entero) haría lento cada dibujado y
+/// Spotify rechazaría la consulta.
+const MAX_SEARCH_CHARS: usize = 200;
+
 /// Texto pegado en el buscador: los saltos de línea y tabuladores separan
 /// palabras (se cambian por un espacio) y el resto de caracteres de control
 /// se quitan.
@@ -223,7 +249,7 @@ mod tests {
     use super::*;
     use crate::app::tests::{album, crash, key, status, test_app};
     use crate::app::{CrashOrigin, MainContent};
-    use crate::spotify::{SearchKind, SearchResults};
+    use crate::spotify::{ApiError, SearchKind, SearchResults};
 
     fn key_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
@@ -405,6 +431,108 @@ mod tests {
             }
             _ => panic!("la ventana debe seguir abierta con su lista"),
         }
+    }
+
+    /// Un pegado enorme no hace crecer la búsqueda sin límite; lo que cabe
+    /// se conserva entero, también con caracteres de varios bytes.
+    #[tokio::test]
+    async fn search_text_has_a_cap() {
+        let (mut app, _rx) = test_app();
+        app.on_event(key(KeyCode::Char('/')));
+        app.on_event(Event::Paste("ñ".repeat(1_000_000)));
+        assert_eq!(app.search_input.chars().count(), MAX_SEARCH_CHARS);
+        app.on_event(key(KeyCode::Char('x')));
+        assert_eq!(app.search_input.chars().count(), MAX_SEARCH_CHARS);
+        app.on_event(key(KeyCode::Backspace));
+        app.on_event(key(KeyCode::Char('x')));
+        assert!(app.search_input.ends_with('x'));
+    }
+
+    /// Reproducción de prueba que espera dispositivo.
+    fn waiting_play() -> Action {
+        Action::PlayTracks {
+            tracks: Vec::new(),
+            start: 2,
+            device_id: None,
+        }
+    }
+
+    /// Si Enter falla por no haber dispositivo activo, se abre la ventana de
+    /// dispositivos y la reproducción se repite en el que se elija.
+    #[tokio::test]
+    async fn play_without_device_asks_for_one_and_replays_there() {
+        let (mut app, _rx) = test_app();
+        app.on_msg(Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            replay: Some(Box::new(waiting_play())),
+            result: Err(anyhow::Error::new(ApiError::player(404))),
+        });
+        assert!(matches!(app.popup, Popup::Devices { devices: None, .. }));
+        assert!(app.pending_play.is_some());
+        assert!(status(&app).is_some_and(|s| s.contains("elige dónde")));
+
+        // Al elegir, la reproducción se consume (se repite una sola vez).
+        app.on_msg(Msg::Devices {
+            request: app.devices_request,
+            result: Ok(vec![device("altavoz", false)]),
+        });
+        app.on_event(key(KeyCode::Enter));
+        assert!(matches!(app.popup, Popup::None));
+        assert!(app.pending_play.is_none(), "se repite una sola vez");
+
+        // El dispositivo elegido recibe la reproducción, no una transferencia.
+        assert!(matches!(
+            device_choice(Some(waiting_play()), "altavoz".into()),
+            Action::PlayTracks { start: 2, device_id: Some(id), .. } if id == "altavoz"
+        ));
+        assert!(matches!(
+            device_choice(None, "altavoz".into()),
+            Action::Transfer { device_id } if device_id == "altavoz"
+        ));
+    }
+
+    /// Cerrar la ventana descarta la reproducción pendiente: abrirla después
+    /// con 'd' solo transfiere. Con otra ventana abierta no se interrumpe:
+    /// solo se avisa.
+    #[tokio::test]
+    async fn pending_play_is_dropped_or_not_intrusive() {
+        let (mut app, _rx) = test_app();
+        let no_device = || Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            replay: Some(Box::new(waiting_play())),
+            result: Err(anyhow::Error::new(ApiError::player(404))),
+        };
+        app.on_msg(no_device());
+        app.on_event(key(KeyCode::Esc));
+        assert!(matches!(app.popup, Popup::None));
+        assert!(app.pending_play.is_none());
+
+        // También si se cierra sola (no se pudieron listar los dispositivos).
+        app.on_msg(no_device());
+        app.on_msg(Msg::Devices {
+            request: app.devices_request,
+            result: Err(anyhow::anyhow!("sin red")),
+        });
+        assert!(matches!(app.popup, Popup::None));
+        assert!(app.pending_play.is_none());
+
+        app.on_event(key(KeyCode::Char('?')));
+        app.on_msg(no_device());
+        assert!(matches!(app.popup, Popup::Help));
+        assert!(app.pending_play.is_none());
+        assert!(status(&app).is_some_and(|s| s.contains("dispositivo")));
+
+        // Otros errores de una reproducción no abren la ventana.
+        app.on_event(key(KeyCode::Esc));
+        app.on_msg(Msg::ActionDone {
+            done: None,
+            refresh_queue: true,
+            replay: Some(Box::new(waiting_play())),
+            result: Err(anyhow::Error::new(ApiError::player(403))),
+        });
+        assert!(matches!(app.popup, Popup::None));
     }
 
     /// Abre una ventana y la cierra por uno de sus caminos.

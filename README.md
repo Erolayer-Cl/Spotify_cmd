@@ -55,11 +55,11 @@ Ten Spotify abierto en algún dispositivo (móvil, PC…): esta herramienta es u
 | `?` | Todas las teclas |
 | `q` | Salir |
 
-¿Problemas? `spotify_cmd --help` (opciones `--manual-auth` para SSH, `--halfblocks` si la imagen se ve mal y `--logout`).
+¿Problemas? `spotify_cmd --help` (opciones `--manual-auth` para SSH, `--halfblocks` si la imagen se ve mal y `--logout`). Si no hay ningún dispositivo activo, `Enter` en una canción abre la lista de dispositivos y suena en el que elijas.
 
 ## Pruebas
 
 ```bash
-cargo test                  # 29 pruebas: UI en todos los tamaños, 5000 teclas al azar, respuestas reales de Spotify
-tests/e2e/run_all.sh        # app real contra una API simulada: funcional, red caída, token, caos, velocidad y memoria (requiere `pip install pyte`)
+cargo test                  # unas 150 pruebas: UI en todos los tamaños, miles de teclas al azar, respuestas reales de Spotify
+tests/e2e/run_all.sh        # app real contra una API simulada: funcional, sin dispositivo, red caída, token, caos, velocidad, memoria y ventanas (requiere `pip install pyte`)
 ```
